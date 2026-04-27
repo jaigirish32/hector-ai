@@ -1,0 +1,81 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# uv
+uv.lock      # opinion: many projects DO commit this; uncomment to commit
+.python-version
+
+# ============================================================
+# HECTOR-AI specific
+# ============================================================
+
+# Local SQLite database — contains user-uploaded file metadata
+# and provider file_ids. Each user has their own.
+hector.db
+hector.db-journal
+hector.db-wal
+hector.db-shm
+
+# Test databases and artifacts
+test_*.db
+test_*.db-journal
+test_*.db-wal
+test_*.db-shm
+test_upload.pdf
+test_with_file.pdf
+test_sample.txt
+
+# ============================================================
+# Secrets — defense-in-depth
+# ============================================================
+# Keys are stored in OS keyring, not in files, but never commit:
+*.key
+*.pem
+.env
+.env.*
+secrets.json
+config.local.json
+
+# ============================================================
+# IDE / Editor
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ============================================================
+# OS
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/

@@ -1,0 +1,15 @@
+[project]
+name = "hector-ai"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.97.0",
+    "google-genai>=1.73.1",
+    "keyring>=25.7.0",
+    "openai>=2.32.0",
+    "openpyxl>=3.1.5",
+    "pypdf>=6.10.2",
+    "pyside6>=6.11.0",
+]
