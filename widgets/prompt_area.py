@@ -27,7 +27,7 @@ from widgets.model_chip import ModelChip
 class PromptArea(QFrame):
     """Top panel where the user composes a prompt and picks models."""
 
-    # User clicked Run — payload = (prompt_text, [selected_model_ids], [file_paths])
+    # User clicked Run — payload = (prompt_text, [selected_model_ids], [file_paths_as_strings])
     run_requested = Signal(str, list, list)
 
     def __init__(self) -> None:
@@ -57,7 +57,7 @@ class PromptArea(QFrame):
         self._prompt_input = QTextEdit()
         self._prompt_input.setObjectName("promptInput")
         self._prompt_input.setPlaceholderText(
-            "Ask HECTOR anything. Attach an image to compare multimodal models."
+            "Ask HECTOR anything. Attach a PDF to compare how each model reads it."
         )
         self._prompt_input.setMinimumHeight(80)
         self._prompt_input.setMaximumHeight(160)
@@ -93,8 +93,9 @@ class PromptArea(QFrame):
             chip.toggled_changed.connect(self._on_chip_toggled)
             self._chips.append(chip)
             chips_row.addWidget(chip)
-            chips_row.addStretch()
-            root.addLayout(chips_row)
+
+        chips_row.addStretch()
+        root.addLayout(chips_row)
 
         # ---------- Section 4: bottom control row (params + run button) ----------
         separator = QFrame()
@@ -142,11 +143,13 @@ class PromptArea(QFrame):
         self._char_counter.setText(f"{count} / 8000")
 
     def _open_file_picker(self) -> None:
+        # Filter narrowed to PDF for now. Excel and image support
+        # arrive in Phase 2e; we'll widen the filter at that point.
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Attach files",
             "",
-            "Images and documents (*.png *.jpg *.jpeg *.pdf *.txt);;All files (*)",
+            "PDF documents (*.pdf);;All files (*)",
         )
         for path_str in paths:
             self._add_attached_file(Path(path_str))
@@ -182,7 +185,6 @@ class PromptArea(QFrame):
 
         # Disable the button if nothing is selected.
         self._run_button.setEnabled(selected_count >= 1)
-
 
     def _on_run_clicked(self) -> None:
         prompt = self.prompt_text()

@@ -2,10 +2,13 @@
 The Compare view — workspace where users run prompts against multiple LLMs
 side by side.
 
-Reads selected models from the prompt area, dispatches real parallel API
-calls via the Dispatcher, and updates cards as responses arrive.
+Reads selected models and attached files from the prompt area, dispatches
+real parallel API calls via the Dispatcher, and updates cards as
+responses arrive.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -131,19 +134,34 @@ class ComparisonView(QWidget):
         model_ids: list,
         file_paths: list,
     ) -> None:
-        """User clicked Run — lay out cards and dispatch real requests."""
+        """User clicked Run — lay out cards and dispatch real requests.
+
+        file_paths arrives from PromptArea as a list of strings (paths
+        serialized over the Qt signal). We convert back to Path objects
+        before handing off to the dispatcher.
+        """
         models = [m for m_id in model_ids if (m := get_model(m_id)) is not None]
         if not models:
             return
 
         self._lay_out_cards(models)
 
-        # Mark every card as loading immediately.
+        # Mark every card as loading immediately. The dispatcher will
+        # update cards as responses arrive (or as file uploads fail).
         for card in self._cards.values():
             card.set_loading()
 
-        # Fire the real dispatcher. Responses arrive via signals.
-        self._dispatcher.dispatch(prompt=prompt, model_ids=model_ids)
+        # Convert string paths back to Path objects. PromptArea serializes
+        # them as strings because Qt signals don't always handle Path types
+        # cleanly across threads.
+        paths = [Path(p) for p in file_paths]
+
+        # Fire the real dispatcher with files. Responses arrive via signals.
+        self._dispatcher.dispatch(
+            prompt=prompt,
+            model_ids=model_ids,
+            file_paths=paths,
+        )
 
     # ----------------------------------------------------------------------
     # Event handlers — dispatcher signals
