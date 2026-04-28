@@ -164,10 +164,15 @@ class ComparisonView(QWidget):
             refs = self._file_library.get_refs_for_provider(selected_ids, provider_key)
             per_model_refs[model.id] = tuple(refs)
 
+        # Pass attached_file_ids so the dispatcher can pre-flight check
+        # whether each provider has refs for all attached files. Models
+        # with partial coverage get a caveat attached to their response;
+        # models with zero coverage get a structured failure.
         self._dispatcher.dispatch_with_resolved_refs(
             prompt=prompt,
             model_ids=model_ids,
             per_model_refs=per_model_refs,
+            attached_file_ids=selected_ids,
         )
 
     # ---------- Dispatcher signal handlers ----------
@@ -181,6 +186,7 @@ class ComparisonView(QWidget):
             latency_seconds=response.latency_seconds,
             tokens=response.input_tokens + response.output_tokens,
             cost_usd=response.cost_usd,
+            caveats=response.caveats,
         )
 
     def _on_response_failed(self, model_id: str, message: str) -> None:

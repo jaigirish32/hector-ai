@@ -3,7 +3,8 @@ The FILES section in the left sidebar.
 
 Lists files in the user's library. Each row has a checkbox (selects
 file for next Run) and a delete button. A "+ Add file" button at the
-bottom triggers an upload to all configured providers.
+bottom triggers an upload to the providers that natively support
+the file's type.
 
 Persists across app sessions because state lives in SQLite via the
 shared FileLibrary instance.
@@ -28,6 +29,17 @@ from PySide6.QtWidgets import (
 )
 
 from attachments.file_library import FileLibrary, LibraryFile, UploadOutcome, DeleteOutcome
+
+
+# Phase 1 native-supported file types. Update alongside the routing layer's
+# capability matrix as new types come in (docx, pptx, gif, webp, etc.).
+_FILE_DIALOG_FILTER = (
+    "Supported files (*.pdf *.xlsx *.csv *.png *.jpg *.jpeg);;"
+    "PDF documents (*.pdf);;"
+    "Spreadsheets (*.xlsx *.csv);;"
+    "Images (*.png *.jpg *.jpeg);;"
+    "All files (*)"
+)
 
 
 # ---------- Worker signals ----------
@@ -181,7 +193,7 @@ class FileLibraryPanel(QWidget):
             self,
             "Add files to library",
             "",
-            "PDF documents (*.pdf);;All files (*)",
+            _FILE_DIALOG_FILTER,
         )
         if not paths:
             return
@@ -229,13 +241,35 @@ class FileLibraryPanel(QWidget):
             self._set_busy(False)
             self._pending_uploads = 0
 
-        if outcome.failed_providers and not outcome.successful_providers:
+        filename = outcome.file_record.filename
+        n_success = len(outcome.successful_providers)
+        n_failed = len(outcome.failed_providers)
+        n_skipped = len(outcome.skipped_providers)
+
+        # Hard failure: nothing succeeded AND nothing was skipped
+        # (so every provider tried and every provider errored).
+        if n_success == 0 and n_failed > 0 and n_skipped == 0:
             QMessageBox.warning(
                 self,
                 "Upload failed",
-                f"Could not upload {outcome.file_record.filename} to any provider.\n\n"
+                f"Could not upload {filename} to any provider.\n\n"
                 + "\n".join(f"- {p}: {msg}" for p, msg in outcome.failed_providers.items()),
             )
+            return
+
+        # Hard wall: zero providers natively support this file type.
+        # Different message — retry won't fix it; user needs a different file or provider.
+        if n_success == 0 and n_failed == 0 and n_skipped > 0:
+            QMessageBox.warning(
+                self,
+                "File type not supported",
+                f"None of your configured providers natively support {filename}.\n\n"
+                "The file is in your library but cannot be used in chat. "
+                "Either configure a provider that supports this type, or use a "
+                "different file.",
+            )
+            self._refresh_from_library()
+            self.selection_changed.emit(self.selected_file_ids())
             return
 
         # Refresh the list from the registry to pick up the new row.
@@ -243,15 +277,27 @@ class FileLibraryPanel(QWidget):
         # Newly-added file is checked by default (refresh checks all).
         self.selection_changed.emit(self.selected_file_ids())
 
-        if outcome.failed_providers:
+        # Partial success — surface skipped providers and any upload failures.
+        # We combine them into one dialog so the user gets the full picture
+        # at a glance instead of two consecutive popups.
+        notes: list[str] = []
+        if n_skipped > 0:
+            skipped_names = ", ".join(sorted(outcome.skipped_providers.keys()))
+            notes.append(
+                f"Not natively supported by: {skipped_names}. "
+                f"These models will be unavailable for this file at Run time."
+            )
+        if n_failed > 0:
+            notes.append(
+                "Upload errors:\n"
+                + "\n".join(f"  - {p}: {msg}" for p, msg in outcome.failed_providers.items())
+            )
+
+        if notes:
             QMessageBox.information(
                 self,
-                "Partial upload",
-                f"Uploaded {outcome.file_record.filename} to "
-                f"{len(outcome.successful_providers)} of "
-                f"{len(outcome.successful_providers) + len(outcome.failed_providers)} "
-                "providers.\n\nFailed: "
-                + ", ".join(outcome.failed_providers.keys()),
+                f"Added {filename}",
+                f"Uploaded to {n_success} provider(s).\n\n" + "\n\n".join(notes),
             )
 
     def _on_delete_finished(self, outcome: DeleteOutcome) -> None:

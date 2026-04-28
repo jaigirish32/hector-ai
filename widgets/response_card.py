@@ -8,6 +8,11 @@ State machine:
     ERROR    -> request failed, card shows the error message
 
 Supports 'up' / 'down' voting which a future analytics layer can log.
+
+Caveats: when set_response is called with caveats (e.g. "this provider
+only saw 1 of 2 attached files"), they appear in italic grey text
+between the answer body and the metrics footer. Hidden when no caveats
+are present and in non-COMPLETE states.
 """
 from enum import Enum
 
@@ -79,6 +84,19 @@ class ResponseCard(QFrame):
         self._body.setMinimumHeight(140)
         self._body.setPlaceholderText("Waiting for prompt...")
         root.addWidget(self._body, stretch=1)
+
+        # ---------- Caveats (hidden by default) ----------
+        # Sits between body and footer. Italic grey text. Wraps. Visible
+        # only when caveats are present and the card is in COMPLETE state.
+        self._caveats_label = QLabel("")
+        self._caveats_label.setObjectName("cardCaveat")
+        self._caveats_label.setWordWrap(True)
+        self._caveats_label.setStyleSheet(
+            "color: #8A8A8A; font-size: 11px; font-style: italic; "
+            "padding: 6px 12px 0 12px;"
+        )
+        self._caveats_label.setVisible(False)
+        root.addWidget(self._caveats_label)
 
         # ---------- Footer (metrics + vote buttons) ----------
         self._footer = self._build_footer()
@@ -197,6 +215,7 @@ class ResponseCard(QFrame):
         self._body.setPlaceholderText("Generating response...")
         self._body.clear()
         self._update_metrics("—", "—", "—")
+        self._set_caveats(())
         self._set_status("GENERATING", accent=False)
         self._apply_state()
 
@@ -206,8 +225,13 @@ class ResponseCard(QFrame):
         latency_seconds: float,
         tokens: int,
         cost_usd: float,
+        caveats: tuple[str, ...] = (),
     ) -> None:
-        """Populate the card with a successful response."""
+        """Populate the card with a successful response.
+
+        caveats appear under the answer in italic grey text. Pass an
+        empty tuple (default) to omit. Each caveat becomes its own line.
+        """
         self._state = CardState.COMPLETE
         self._body.setPlainText(text)
         self._update_metrics(
@@ -215,6 +239,7 @@ class ResponseCard(QFrame):
             f"{tokens}",
             f"${cost_usd:.4f}",
         )
+        self._set_caveats(caveats)
         self._set_status("", accent=False)
         self._apply_state()
 
@@ -223,6 +248,7 @@ class ResponseCard(QFrame):
         self._state = CardState.ERROR
         self._body.setPlainText(f"Error: {message}")
         self._update_metrics("—", "—", "—")
+        self._set_caveats(())
         self._set_status("FAILED", accent=False)
         self._apply_state()
 
@@ -236,6 +262,7 @@ class ResponseCard(QFrame):
         self._body.clear()
         self._body.setPlaceholderText("Waiting for prompt...")
         self._update_metrics("—", "—", "—")
+        self._set_caveats(())
         self._set_status("", accent=False)
         self._apply_state()
 
@@ -251,6 +278,19 @@ class ResponseCard(QFrame):
         self._latency_metric.value_label.setText(latency)
         self._tokens_metric.value_label.setText(tokens)
         self._cost_metric.value_label.setText(cost)
+
+    def _set_caveats(self, caveats: tuple[str, ...]) -> None:
+        """Show or hide the caveats label. Multiple caveats are joined
+        with newlines so each appears on its own line."""
+        if not caveats:
+            self._caveats_label.setVisible(False)
+            self._caveats_label.setText("")
+            return
+        # Each caveat on its own line, prefixed with a soft bullet so
+        # multi-caveat cases read clearly.
+        text = "\n".join(f"• {c}" for c in caveats)
+        self._caveats_label.setText(text)
+        self._caveats_label.setVisible(True)
 
     def _set_status(self, text: str, accent: bool) -> None:
         """Set the small status/winner badge in the header."""

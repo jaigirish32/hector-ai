@@ -7,27 +7,25 @@ delete, surfaces partial failures cleanly, and presents a clean
 file-centric API that doesn't leak provider details.
 
 Operations:
-    add_file(path)          — upload to all 4 providers, register in DB
-    delete_file(file_id)    — delete from all 4 providers + DB
+    add_file(path)          — upload to providers that natively support
+                              the file type, register in DB
+    delete_file(file_id)    — delete from all providers + DB
     list_files()            — return all registered files for the sidebar
     get_refs(file_ids, p)   — get cached refs for the given files at provider p
 
-Excel handling:
-    .xlsx files are converted in-memory to a single concatenated CSV
-    (sheets separated by '=== Sheet: <name> ===' markers), spooled to a
-    short-lived temp file, and that CSV is what gets uploaded to all four
-    providers. The registry still tracks the original xlsx (filename,
-    hash for dedup), but the registered mime_type is 'text/csv' to
-    reflect what's actually at the provider end.
+Native-only architecture (Phase 2e):
+    No preprocessing. The file as-uploaded is what goes to providers.
+    Before uploading, we consult the routing layer to learn which providers
+    natively support the file type. Providers that don't are skipped — not
+    failed — so the UI can distinguish "no native path exists" from
+    "tried and the network/auth blew up."
 """
 from __future__ import annotations
 
 import mimetypes
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from attachments.excel_converter import convert_xlsx_to_csv_bytes
 from attachments.registry import FileRecord, FileRegistry
 from attachments.uploaders import (
     AnthropicUploader,
@@ -38,10 +36,12 @@ from attachments.uploaders import (
     ProviderUploadResult,
 )
 from providers.base import FileRef
+from routing.router import RoutingPlan, route
 from settings_manager import SettingsManager
 
 
 # Map our internal provider key to the corresponding uploader class.
+# These keys MUST match the provider names in routing/capability_matrix.py.
 _UPLOADER_CLASSES: dict[str, type[BaseUploader]] = {
     "anthropic": AnthropicUploader,
     "gemini": GeminiUploader,
@@ -62,11 +62,21 @@ class LibraryFile:
 
 @dataclass(frozen=True)
 class UploadOutcome:
-    """Result of attempting to upload one file to all providers."""
+    """Result of attempting to upload one file to all providers.
+
+    Three categories, deliberately kept separate so the UI can render
+    them differently:
+      successful — file is at the provider, ready for chat
+      failed     — we tried to upload but it errored (network/auth/etc).
+                   May resolve on retry.
+      skipped    — we didn't try because the provider does not natively
+                   support this file type. Retry won't change anything;
+                   the user needs a different provider for this file.
+    """
     file_record: FileRecord
-    successful_providers: list[str]    # providers where upload succeeded
-    failed_providers: dict[str, str]   # provider name -> error message
-    warnings: list[str] = field(default_factory=list)  # e.g. xlsx conversion notes
+    successful_providers: list[str]
+    failed_providers: dict[str, str]
+    skipped_providers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,67 +105,63 @@ class FileLibrary:
     # ---------- Public operations ----------
 
     def add_file(self, path: Path) -> UploadOutcome:
-        """Register a new file and upload it to all configured providers.
+        """Register a new file and upload it to providers that natively
+        support its type.
 
-        For .xlsx files, the workbook is converted to a single concatenated
-        CSV in memory and that CSV is what gets uploaded. The registry
-        still tracks the xlsx (filename + hash) so the sidebar shows the
-        user's actual file, but the recorded mime_type is text/csv.
+        Steps:
+          1. Compute the file's mime type and size.
+          2. Ask the router which providers natively support it.
+          3. Register the file locally (so we have a record even if all
+             uploads fail or no provider supports it).
+          4. Upload to each supported provider; record outcomes.
 
-        Returns an UploadOutcome reporting which providers succeeded and
-        which failed. Even if ALL providers fail, the file is still
-        registered locally so we can retry uploads later.
+        Providers that don't natively support the file type appear in
+        skipped_providers, not failed_providers — they're a different
+        category from "we tried and it errored."
         """
         path = Path(path).resolve()
-        is_xlsx = path.suffix.lower() == ".xlsx"
+        size_bytes = path.stat().st_size
+        mime_type = self._guess_mime_type(path)
 
-        # Convert xlsx -> CSV bytes BEFORE touching the registry, so a bad
-        # workbook fails fast without leaving an orphan record.
-        conversion_warnings: list[str] = []
-        if is_xlsx:
-            conversion = convert_xlsx_to_csv_bytes(path)
-            conversion_warnings = list(conversion.warnings)
-            upload_mime = "text/csv"
-            csv_bytes = conversion.csv_bytes
-        else:
-            upload_mime = self._guess_mime_type(path)
-            csv_bytes = b""  # unused
+        # Step 1: route. The router answers, per provider, whether this
+        # (mime, size) combination is supported. We hand it the full set
+        # of providers we know about — UI-level "which chips did the user
+        # pick" is a separate concern that lives in the dispatcher, not here.
+        plan: RoutingPlan = route(
+            mime=mime_type,
+            file_size_bytes=size_bytes,
+            selected_providers=list(_UPLOADER_CLASSES.keys()),
+        )
 
-        # Register against the original path (correct filename + hash for
-        # dedup) but with the upload mime (what providers actually receive).
-        file_record = self._registry.register_file(path, mime_type=upload_mime)
+        supported_providers = {sp.name for sp in plan.supported}
+        skipped: dict[str, str] = {
+            sk.name: sk.detail or sk.reason.value
+            for sk in plan.skipped
+        }
 
+        # Step 2: register locally with the file's true mime type.
+        # We register even if no provider supports it — keeps the file
+        # visible in the library so the user can see why it's unusable.
+        file_record = self._registry.register_file(path, mime_type=mime_type)
+
+        # Step 3: upload only to supported providers.
         successes: list[str] = []
         failures: dict[str, str] = {}
 
-        if is_xlsx:
-            # Spool the CSV to <tmpdir>/<original_stem>.csv so the
-            # provider-side filename is sane (e.g. '2_Khoub.csv', not
-            # 'tmpXYZ.csv'). Tempdir cleans up on context exit.
-            with tempfile.TemporaryDirectory(prefix="hector_xlsx_") as tmpdir:
-                csv_path = Path(tmpdir) / f"{path.stem}.csv"
-                csv_path.write_bytes(csv_bytes)
-                self._upload_to_providers(
-                    file_record=file_record,
-                    source_path=csv_path,
-                    source_mime=upload_mime,
-                    successes=successes,
-                    failures=failures,
-                )
-        else:
-            self._upload_to_providers(
-                file_record=file_record,
-                source_path=path,
-                source_mime=upload_mime,
-                successes=successes,
-                failures=failures,
-            )
+        self._upload_to_providers(
+            file_record=file_record,
+            source_path=path,
+            source_mime=mime_type,
+            allowed_providers=supported_providers,
+            successes=successes,
+            failures=failures,
+        )
 
         return UploadOutcome(
             file_record=file_record,
             successful_providers=successes,
             failed_providers=failures,
-            warnings=conversion_warnings,
+            skipped_providers=skipped,
         )
 
     def delete_file(self, file_id: int) -> DeleteOutcome:
@@ -201,16 +207,15 @@ class FileLibrary:
     def list_files(self) -> list[LibraryFile]:
         """Return all files in the library, with provider upload status.
 
-        Used by the sidebar to display the file list. Filters out files
-        that have NO valid provider refs (they're effectively orphaned
-        and shouldn't appear).
+        Used by the sidebar to display the file list. Returns ALL registered
+        files including those with no successful provider uploads — the
+        sidebar can render them with an "unsupported" indicator. Filtering
+        out orphans is the caller's choice, not ours.
         """
         result: list[LibraryFile] = []
 
         for record in self._all_file_records():
             refs = self._registry.list_provider_refs(record.id)
-            if not refs:
-                continue  # No valid refs — skip this orphan
             providers_uploaded = [r.provider for r in refs]
             result.append(LibraryFile(
                 file_id=record.id,
@@ -263,16 +268,24 @@ class FileLibrary:
         file_record: FileRecord,
         source_path: Path,
         source_mime: str,
+        allowed_providers: set[str],
         successes: list[str],
         failures: dict[str, str],
     ) -> None:
-        """Upload source_path to every configured provider, recording results.
+        """Upload source_path to every configured AND allowed provider.
+
+        allowed_providers is the router's verdict: only these providers
+        natively support this file type. Others were already recorded
+        as skipped by the caller and aren't retried here.
 
         Skips providers that already have a cached ref for this file_id.
         Mutates the passed-in successes/failures collections rather than
         returning them, since the caller owns the aggregation.
         """
         for provider_name, uploader in self._uploaders.items():
+            if provider_name not in allowed_providers:
+                continue  # router said no — not our concern here
+
             if not uploader.is_configured():
                 failures[provider_name] = "Provider not configured"
                 continue
@@ -319,6 +332,11 @@ class FileLibrary:
         suffix = path.suffix.lower()
         if suffix == ".pdf":
             return "application/pdf"
+        if suffix == ".xlsx":
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if suffix == ".csv":
+            return "text/csv"
         if suffix in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
-            return f"image/{suffix.lstrip('.')}"
+            ext = suffix.lstrip(".")
+            return f"image/{'jpeg' if ext == 'jpg' else ext}"
         return "application/octet-stream"

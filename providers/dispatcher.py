@@ -5,6 +5,18 @@ Two dispatch paths:
 - dispatch(): files are resolved at run time via FileOrchestrator (legacy).
 - dispatch_with_resolved_refs(): files are pre-resolved by FileLibrary
   at attach time; we just hand off ready-made refs to chat clients.
+
+Native-only routing (Phase 2e), permissive policy:
+    Before fanning out, dispatch_with_resolved_refs counts how many of
+    the user's attached files each model's provider has refs for.
+      - Zero refs (and files were attached) → skip the model with a
+        structured response_failed. The model would otherwise have
+        nothing to work with and would hallucinate.
+      - Some but not all refs → DISPATCH with the subset, attach a
+        caveat to the response so the user sees that partial coverage.
+        Lets a PDF-supporting provider answer about the PDF even when
+        an attached xlsx isn't supported.
+      - All refs → dispatch normally, no caveat.
 """
 from __future__ import annotations
 
@@ -44,21 +56,41 @@ class _WorkerSignals(QObject):
 
 
 class _ProviderWorker(QRunnable):
+    """Runs one provider call. Optional pre_caveats are merged into the
+    response's own caveats on success — used by the dispatcher to surface
+    routing-layer notes (e.g. partial file coverage) alongside any caveats
+    the provider client itself may have produced."""
+
     def __init__(
         self,
         client: BaseProviderClient,
         request: ChatRequest,
         signals: _WorkerSignals,
+        pre_caveats: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self._client = client
         self._request = request
         self._signals = signals
+        self._pre_caveats = pre_caveats
 
     def run(self) -> None:
         model_id = self._request.model.id
         try:
             response = self._client.complete(self._request)
+            if self._pre_caveats:
+                # Prepend dispatcher-level caveats so they appear first;
+                # any caveats the provider client added stay after them.
+                merged = tuple(self._pre_caveats) + tuple(response.caveats)
+                response = ChatResponse(
+                    text=response.text,
+                    latency_seconds=response.latency_seconds,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    cost_usd=response.cost_usd,
+                    served_model=response.served_model,
+                    caveats=merged,
+                )
             self._signals.succeeded.emit(model_id, response)
         except ProviderError as exc:
             self._signals.failed.emit(model_id, str(exc))
@@ -108,34 +140,79 @@ class Dispatcher(QObject):
         prompt: str,
         model_ids: list[str],
         per_model_refs: dict[str, tuple[FileRef, ...]] | None = None,
+        attached_file_ids: list[int] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 2048,
         system_prompt: str = "",
     ) -> None:
         """Fan out using file_refs that the caller has already resolved.
 
-        Used when files were uploaded at attach time (via FileLibrary)
-        rather than at run time. Skips the orchestrator entirely.
+        attached_file_ids is the list of file_ids the user has selected
+        in the sidebar for this Run. The dispatcher uses it to detect:
+          - Zero coverage: model gets a structured response_failed.
+          - Partial coverage: model is dispatched with a caveat that
+            will appear under its answer.
+          - Full coverage: model is dispatched normally.
+
+        If attached_file_ids is None or empty, the pre-flight check is
+        skipped — preserves existing behaviour for text-only Runs.
         """
         if self._pending_count > 0:
             return
 
         per_model_refs = per_model_refs or {}
+        attached_file_ids = attached_file_ids or []
+        expected_file_count = len(attached_file_ids)
 
-        runnable_jobs: list[tuple[str, ChatRequest, BaseProviderClient]] = []
+        runnable_jobs: list[
+            tuple[str, ChatRequest, BaseProviderClient, tuple[str, ...]]
+        ] = []
+        skipped_jobs: list[tuple[str, str]] = []
+
         for model_id in model_ids:
             model = get_model(model_id)
             if model is None:
-                self.response_failed.emit(model_id, f"Unknown model: {model_id}")
+                skipped_jobs.append((model_id, f"Unknown model: {model_id}"))
                 continue
 
             client = self._clients.get(model.provider)
             if client is None:
-                self.response_failed.emit(
+                skipped_jobs.append((
                     model_id,
                     f"No client for provider: {model.provider.value}",
-                )
+                ))
                 continue
+
+            refs_for_model = per_model_refs.get(model_id, ())
+            n_refs = len(refs_for_model)
+
+            pre_caveats: tuple[str, ...] = ()
+
+            # Pre-flight check only matters when files are attached.
+            if expected_file_count > 0:
+                if n_refs == 0:
+                    # Zero coverage. The model would have nothing to look
+                    # at and any answer would be a hallucination — skip.
+                    skipped_jobs.append((
+                        model_id,
+                        f"This provider doesn't natively support any of the "
+                        f"{expected_file_count} attached file(s). "
+                        f"Try a different model for these files, "
+                        f"or use a different file type.",
+                    ))
+                    continue
+
+                if n_refs < expected_file_count:
+                    # Partial coverage. Dispatch with what we have, and
+                    # attach a caveat so the user sees that this provider
+                    # only saw a subset of the files.
+                    missing = expected_file_count - n_refs
+                    pre_caveats = (
+                        f"This provider only saw {n_refs} of "
+                        f"{expected_file_count} attached file(s); "
+                        f"{missing} file(s) were skipped because the type "
+                        f"isn't natively supported here.",
+                    )
 
             request = ChatRequest(
                 prompt=prompt,
@@ -143,17 +220,22 @@ class Dispatcher(QObject):
                 temperature=temperature,
                 max_tokens=max_tokens,
                 system_prompt=system_prompt or None,
-                file_refs=per_model_refs.get(model_id, ()),
+                file_refs=refs_for_model,
             )
-            runnable_jobs.append((model_id, request, client))
+            runnable_jobs.append((model_id, request, client, pre_caveats))
+
+        # Emit skip signals first — synchronous, immediate UI feedback —
+        # then start workers for the rest.
+        for model_id, message in skipped_jobs:
+            self.response_failed.emit(model_id, message)
 
         if not runnable_jobs:
             self.all_complete.emit()
             return
 
         self._pending_count = len(runnable_jobs)
-        for model_id, request, client in runnable_jobs:
-            worker = _ProviderWorker(client, request, self._signals)
+        for model_id, request, client, pre_caveats in runnable_jobs:
+            worker = _ProviderWorker(client, request, self._signals, pre_caveats)
             self._pool.start(worker)
 
     # ---------- Legacy dispatch: file paths resolved at run time ----------

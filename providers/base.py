@@ -9,7 +9,7 @@ the request is going to.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from models import ModelInfo
@@ -60,6 +60,15 @@ class ChatResponse:
     (latency, token counts, cost). The cost is computed locally from
     token counts using the model's published price; we don't trust
     providers to report cost.
+
+    caveats carries per-call notes the UI should surface alongside the
+    answer. Examples:
+      - dispatcher attaches "Note: 1 of 2 files (xlsx) not supported on
+        this provider" when the model only saw a subset of attached files
+      - a provider client may attach "Only first 1000 rows per sheet were
+        read" for OpenAI's spreadsheet augmentation truncation
+    Caveats are informational, not errors. They appear under the answer
+    in italic grey text.
     """
     text: str
     latency_seconds: float
@@ -67,6 +76,7 @@ class ChatResponse:
     output_tokens: int
     cost_usd: float
     served_model: str  # exactly what the API reported it served us with
+    caveats: tuple[str, ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
