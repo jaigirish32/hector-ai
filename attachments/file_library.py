@@ -11,13 +11,23 @@ Operations:
     delete_file(file_id)    — delete from all 4 providers + DB
     list_files()            — return all registered files for the sidebar
     get_refs(file_ids, p)   — get cached refs for the given files at provider p
+
+Excel handling:
+    .xlsx files are converted in-memory to a single concatenated CSV
+    (sheets separated by '=== Sheet: <name> ===' markers), spooled to a
+    short-lived temp file, and that CSV is what gets uploaded to all four
+    providers. The registry still tracks the original xlsx (filename,
+    hash for dedup), but the registered mime_type is 'text/csv' to
+    reflect what's actually at the provider end.
 """
 from __future__ import annotations
 
 import mimetypes
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
+from attachments.excel_converter import convert_xlsx_to_csv_bytes
 from attachments.registry import FileRecord, FileRegistry
 from attachments.uploaders import (
     AnthropicUploader,
@@ -56,6 +66,7 @@ class UploadOutcome:
     file_record: FileRecord
     successful_providers: list[str]    # providers where upload succeeded
     failed_providers: dict[str, str]   # provider name -> error message
+    warnings: list[str] = field(default_factory=list)  # e.g. xlsx conversion notes
 
 
 @dataclass(frozen=True)
@@ -86,50 +97,65 @@ class FileLibrary:
     def add_file(self, path: Path) -> UploadOutcome:
         """Register a new file and upload it to all configured providers.
 
+        For .xlsx files, the workbook is converted to a single concatenated
+        CSV in memory and that CSV is what gets uploaded. The registry
+        still tracks the xlsx (filename + hash) so the sidebar shows the
+        user's actual file, but the recorded mime_type is text/csv.
+
         Returns an UploadOutcome reporting which providers succeeded and
         which failed. Even if ALL providers fail, the file is still
         registered locally so we can retry uploads later.
         """
         path = Path(path).resolve()
-        mime_type = self._guess_mime_type(path)
+        is_xlsx = path.suffix.lower() == ".xlsx"
 
-        # Step 1: register the file locally (computes hash, dedups).
-        file_record = self._registry.register_file(path, mime_type=mime_type)
+        # Convert xlsx -> CSV bytes BEFORE touching the registry, so a bad
+        # workbook fails fast without leaving an orphan record.
+        conversion_warnings: list[str] = []
+        if is_xlsx:
+            conversion = convert_xlsx_to_csv_bytes(path)
+            conversion_warnings = list(conversion.warnings)
+            upload_mime = "text/csv"
+            csv_bytes = conversion.csv_bytes
+        else:
+            upload_mime = self._guess_mime_type(path)
+            csv_bytes = b""  # unused
 
-        # Step 2: upload to each configured provider in turn.
-        # We do these sequentially for now — could parallelize with
-        # threads later if upload latency becomes a concern.
+        # Register against the original path (correct filename + hash for
+        # dedup) but with the upload mime (what providers actually receive).
+        file_record = self._registry.register_file(path, mime_type=upload_mime)
+
         successes: list[str] = []
         failures: dict[str, str] = {}
 
-        for provider_name, uploader in self._uploaders.items():
-            if not uploader.is_configured():
-                failures[provider_name] = "Provider not configured"
-                continue
-
-            # Skip if already cached for this provider (rare — happens
-            # if user re-adds a file we previously uploaded).
-            cached = self._registry.get_provider_ref(file_record.id, provider_name)
-            if cached is not None:
-                successes.append(provider_name)
-                continue
-
-            try:
-                result: ProviderUploadResult = uploader.upload(path, mime_type)
-                self._registry.set_provider_ref(
-                    file_id=file_record.id,
-                    provider=provider_name,
-                    remote_id=result.remote_id,
-                    expires_at=result.expires_at,
+        if is_xlsx:
+            # Spool the CSV to <tmpdir>/<original_stem>.csv so the
+            # provider-side filename is sane (e.g. '2_Khoub.csv', not
+            # 'tmpXYZ.csv'). Tempdir cleans up on context exit.
+            with tempfile.TemporaryDirectory(prefix="hector_xlsx_") as tmpdir:
+                csv_path = Path(tmpdir) / f"{path.stem}.csv"
+                csv_path.write_bytes(csv_bytes)
+                self._upload_to_providers(
+                    file_record=file_record,
+                    source_path=csv_path,
+                    source_mime=upload_mime,
+                    successes=successes,
+                    failures=failures,
                 )
-                successes.append(provider_name)
-            except Exception as exc:
-                failures[provider_name] = str(exc)
+        else:
+            self._upload_to_providers(
+                file_record=file_record,
+                source_path=path,
+                source_mime=upload_mime,
+                successes=successes,
+                failures=failures,
+            )
 
         return UploadOutcome(
             file_record=file_record,
             successful_providers=successes,
             failed_providers=failures,
+            warnings=conversion_warnings,
         )
 
     def delete_file(self, file_id: int) -> DeleteOutcome:
@@ -230,6 +256,45 @@ class FileLibrary:
         return refs
 
     # ---------- Internal helpers ----------
+
+    def _upload_to_providers(
+        self,
+        *,
+        file_record: FileRecord,
+        source_path: Path,
+        source_mime: str,
+        successes: list[str],
+        failures: dict[str, str],
+    ) -> None:
+        """Upload source_path to every configured provider, recording results.
+
+        Skips providers that already have a cached ref for this file_id.
+        Mutates the passed-in successes/failures collections rather than
+        returning them, since the caller owns the aggregation.
+        """
+        for provider_name, uploader in self._uploaders.items():
+            if not uploader.is_configured():
+                failures[provider_name] = "Provider not configured"
+                continue
+
+            # Skip if already cached for this provider (rare — happens
+            # if user re-adds a file we previously uploaded).
+            cached = self._registry.get_provider_ref(file_record.id, provider_name)
+            if cached is not None:
+                successes.append(provider_name)
+                continue
+
+            try:
+                result: ProviderUploadResult = uploader.upload(source_path, source_mime)
+                self._registry.set_provider_ref(
+                    file_id=file_record.id,
+                    provider=provider_name,
+                    remote_id=result.remote_id,
+                    expires_at=result.expires_at,
+                )
+                successes.append(provider_name)
+            except Exception as exc:
+                failures[provider_name] = str(exc)
 
     def _all_file_records(self) -> list[FileRecord]:
         """Return all FileRecord rows from the registry, newest first."""
