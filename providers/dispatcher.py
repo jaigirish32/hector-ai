@@ -1,15 +1,10 @@
 """
 The dispatcher — orchestrates multi-provider LLM calls in parallel.
 
-Uses QThreadPool + QRunnable for worker execution. Runnables have no
-event loop of their own — their run() method executes directly on a
-pool thread. Communication back to the main thread goes through a
-separate QObject that lives on the main thread and emits signals.
-
-File handling: when callers pass `file_paths` to dispatch(), the
-dispatcher resolves them per-provider via the FileOrchestrator BEFORE
-fanning out to workers. Each model gets its own ChatRequest with the
-correct file_refs for its provider.
+Two dispatch paths:
+- dispatch(): files are resolved at run time via FileOrchestrator (legacy).
+- dispatch_with_resolved_refs(): files are pre-resolved by FileLibrary
+  at attach time; we just hand off ready-made refs to chat clients.
 """
 from __future__ import annotations
 
@@ -26,6 +21,7 @@ from providers.base import (
     BaseProviderClient,
     ChatRequest,
     ChatResponse,
+    FileRef,
     ProviderError,
 )
 from providers.gemini_client import GeminiClient
@@ -33,8 +29,6 @@ from providers.openai_client import OpenAIClient
 from settings_manager import SettingsManager
 
 
-# Maps Provider enum values to the string keys used by the orchestrator.
-# These strings must match the `provider_name` declared on each uploader.
 _PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
     Provider.OPENAI: "openai",
     Provider.AZURE_OPENAI: "azure_openai",
@@ -43,29 +37,13 @@ _PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Worker signals — a separate QObject because QRunnable can't emit signals
-# ---------------------------------------------------------------------------
-
 class _WorkerSignals(QObject):
-    """Signals that QRunnable workers emit.
-
-    QRunnable isn't a QObject, so it can't define signals itself.
-    We give each worker a signals object owned by the dispatcher.
-    """
-
     succeeded = Signal(str, ChatResponse)
     failed = Signal(str, str)
     finished = Signal(str)
 
 
-# ---------------------------------------------------------------------------
-# Worker — one provider call on one pool thread
-# ---------------------------------------------------------------------------
-
 class _ProviderWorker(QRunnable):
-    """Runs a single ChatRequest on a QThreadPool thread."""
-
     def __init__(
         self,
         client: BaseProviderClient,
@@ -78,7 +56,6 @@ class _ProviderWorker(QRunnable):
         self._signals = signals
 
     def run(self) -> None:
-        """Entry point — runs on a QThreadPool worker thread."""
         model_id = self._request.model.id
         try:
             response = self._client.complete(self._request)
@@ -91,13 +68,7 @@ class _ProviderWorker(QRunnable):
             self._signals.finished.emit(model_id)
 
 
-# ---------------------------------------------------------------------------
-# Dispatcher — fans out requests and collects results
-# ---------------------------------------------------------------------------
-
 class Dispatcher(QObject):
-    """Orchestrates parallel LLM calls across multiple providers."""
-
     response_received = Signal(str, ChatResponse)
     response_failed = Signal(str, str)
     all_complete = Signal()
@@ -117,9 +88,6 @@ class Dispatcher(QObject):
             Provider.GOOGLE: GeminiClient(self._settings),
         }
 
-        # File orchestrator handles upload-and-cache per provider. We give
-        # it the same registry instance the rest of the app uses (or let
-        # it create its own default).
         self._registry = registry or FileRegistry()
         self._orchestrator = FileOrchestrator(
             registry=self._registry,
@@ -129,11 +97,66 @@ class Dispatcher(QObject):
         self._pool = QThreadPool.globalInstance()
         self._pending_count = 0
 
-        # Create a single signals object for all workers. Lives on main thread,
-        # so any signal emission from worker threads crosses into main thread.
         self._signals = _WorkerSignals()
         self._signals.succeeded.connect(self._on_worker_succeeded)
         self._signals.failed.connect(self._on_worker_failed)
+
+    # ---------- Modern dispatch: pre-resolved file refs ----------
+
+    def dispatch_with_resolved_refs(
+        self,
+        prompt: str,
+        model_ids: list[str],
+        per_model_refs: dict[str, tuple[FileRef, ...]] | None = None,
+        temperature: float = 0.7,
+        max_tokens: int = 2048,
+        system_prompt: str = "",
+    ) -> None:
+        """Fan out using file_refs that the caller has already resolved.
+
+        Used when files were uploaded at attach time (via FileLibrary)
+        rather than at run time. Skips the orchestrator entirely.
+        """
+        if self._pending_count > 0:
+            return
+
+        per_model_refs = per_model_refs or {}
+
+        runnable_jobs: list[tuple[str, ChatRequest, BaseProviderClient]] = []
+        for model_id in model_ids:
+            model = get_model(model_id)
+            if model is None:
+                self.response_failed.emit(model_id, f"Unknown model: {model_id}")
+                continue
+
+            client = self._clients.get(model.provider)
+            if client is None:
+                self.response_failed.emit(
+                    model_id,
+                    f"No client for provider: {model.provider.value}",
+                )
+                continue
+
+            request = ChatRequest(
+                prompt=prompt,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt or None,
+                file_refs=per_model_refs.get(model_id, ()),
+            )
+            runnable_jobs.append((model_id, request, client))
+
+        if not runnable_jobs:
+            self.all_complete.emit()
+            return
+
+        self._pending_count = len(runnable_jobs)
+        for model_id, request, client in runnable_jobs:
+            worker = _ProviderWorker(client, request, self._signals)
+            self._pool.start(worker)
+
+    # ---------- Legacy dispatch: file paths resolved at run time ----------
 
     def dispatch(
         self,
@@ -144,43 +167,31 @@ class Dispatcher(QObject):
         system_prompt: str = "",
         file_paths: list[Path] | None = None,
     ) -> None:
-        """Fan out one prompt (with optional files) to every selected model.
+        """Fan out by resolving file paths at run time via the orchestrator.
 
-        Files are resolved synchronously per-provider before the chat
-        workers fan out. This means the call returns once all uploads
-        complete; the chat calls themselves still run in parallel.
-
-        For multiple models on the same provider, the file is uploaded
-        once and the cached file_id is reused for each model.
+        Kept for any caller that still passes raw file_paths. The new
+        attach-at-upload-time flow uses dispatch_with_resolved_refs.
         """
         if self._pending_count > 0:
-            # Already dispatching — ignore duplicate clicks.
             return
 
         file_paths = file_paths or []
 
-        # Step 1: collect the model+client pairs we'll actually be calling.
-        # If a model is unknown or its client isn't configured, we emit
-        # a per-card failure now and exclude it from the fan-out.
-        runnable_jobs: list[tuple[str, "ChatRequest", BaseProviderClient]] = []
+        runnable_jobs: list[tuple[str, ChatRequest, BaseProviderClient]] = []
         for model_id in model_ids:
             model = get_model(model_id)
             if model is None:
-                self.response_failed.emit(
-                    model_id, f"Unknown model: {model_id}"
-                )
+                self.response_failed.emit(model_id, f"Unknown model: {model_id}")
                 continue
 
             client = self._clients.get(model.provider)
             if client is None:
                 self.response_failed.emit(
                     model_id,
-                    f"No client registered for provider: {model.provider.value}. "
-                    "This provider is pending integration.",
+                    f"No client for provider: {model.provider.value}",
                 )
                 continue
 
-            # Step 2: resolve files for this model's provider, if any.
             file_refs_tuple: tuple = ()
             if file_paths:
                 provider_key = _PROVIDER_TO_ORCHESTRATOR_KEY.get(model.provider)
@@ -189,9 +200,6 @@ class Dispatcher(QObject):
                         file_paths, provider_key
                     )
                     if errors:
-                        # Any file-resolution failure for this model means
-                        # we can't reliably answer about the file. Surface
-                        # the error per-card and skip this model's chat call.
                         message = self._format_file_errors(errors)
                         self.response_failed.emit(model_id, message)
                         continue
@@ -213,8 +221,6 @@ class Dispatcher(QObject):
             return
 
         self._pending_count = len(runnable_jobs)
-
-        # Step 3: fan out chat calls to the thread pool.
         for model_id, request, client in runnable_jobs:
             worker = _ProviderWorker(client, request, self._signals)
             self._pool.start(worker)
@@ -235,14 +241,10 @@ class Dispatcher(QObject):
             self._pending_count = 0
             self.all_complete.emit()
 
-    # ---------- Helpers ----------
-
     @staticmethod
     def _format_file_errors(errors: list) -> str:
-        """Turn a list of FileResolutionError into a single human message."""
         if len(errors) == 1:
             err = errors[0]
             return f"File error ({err.file_path.name}): {err.message}"
-        # Multiple files failed — summarize.
         lines = [f"{e.file_path.name}: {e.message}" for e in errors]
         return "File errors:\n" + "\n".join(lines)

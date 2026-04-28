@@ -2,13 +2,10 @@
 The Compare view — workspace where users run prompts against multiple LLMs
 side by side.
 
-Reads selected models and attached files from the prompt area, dispatches
-real parallel API calls via the Dispatcher, and updates cards as
-responses arrive.
+Reads selected files from the sidebar's FileLibraryPanel and dispatches
+real parallel API calls via the Dispatcher.
 """
 from __future__ import annotations
-
-from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -20,23 +17,35 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from models import ModelInfo, get_model
-from providers.base import ChatResponse
+from attachments.file_library import FileLibrary
+from models import ModelInfo, Provider, get_model
+from providers.base import ChatResponse, FileRef
 from providers.dispatcher import Dispatcher
+from widgets.file_library_panel import FileLibraryPanel
 from widgets.prompt_area import PromptArea
 from widgets.response_card import ResponseCard
+
+
+# Same provider key mapping used by the dispatcher's orchestrator path.
+_PROVIDER_TO_LIBRARY_KEY: dict[Provider, str] = {
+    Provider.OPENAI: "openai",
+    Provider.AZURE_OPENAI: "azure_openai",
+    Provider.ANTHROPIC: "anthropic",
+    Provider.GOOGLE: "gemini",
+}
 
 
 class ComparisonView(QWidget):
     """Multi-LLM comparison workspace."""
 
-    def __init__(self) -> None:
+    def __init__(self, file_library: FileLibrary) -> None:
         super().__init__()
 
         self._cards: dict[str, ResponseCard] = {}
+        self._file_library = file_library
+        self._file_panel: FileLibraryPanel | None = None
         self._dispatcher = Dispatcher()
 
-        # Wire dispatcher signals once, at construction.
         self._dispatcher.response_received.connect(self._on_response_received)
         self._dispatcher.response_failed.connect(self._on_response_failed)
         self._dispatcher.all_complete.connect(self._on_all_complete)
@@ -45,12 +54,10 @@ class ComparisonView(QWidget):
         root.setContentsMargins(20, 18, 20, 18)
         root.setSpacing(14)
 
-        # ---------- Top: prompt area ----------
         self._prompt_area = PromptArea()
         self._prompt_area.run_requested.connect(self._on_run_requested)
         root.addWidget(self._prompt_area)
 
-        # ---------- Below: scrollable area for response cards ----------
         self._cards_scroll = QScrollArea()
         self._cards_scroll.setWidgetResizable(True)
         self._cards_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -69,9 +76,13 @@ class ComparisonView(QWidget):
         self._empty_state = self._build_empty_state()
         self._cards_grid.addWidget(self._empty_state, 0, 0)
 
-    # ----------------------------------------------------------------------
-    # UI helpers
-    # ----------------------------------------------------------------------
+    # ---------- Setup wiring ----------
+
+    def set_file_panel(self, panel: FileLibraryPanel) -> None:
+        """Inject the sidebar's file panel so we can read its selection at Run time."""
+        self._file_panel = panel
+
+    # ---------- UI helpers ----------
 
     def _build_empty_state(self) -> QWidget:
         container = QWidget()
@@ -99,7 +110,6 @@ class ComparisonView(QWidget):
         return container
 
     def _clear_cards_grid(self) -> None:
-        """Remove every widget currently in the cards grid."""
         while self._cards_grid.count() > 0:
             item = self._cards_grid.takeAt(0)
             widget = item.widget() if item else None
@@ -109,7 +119,6 @@ class ComparisonView(QWidget):
         self._cards.clear()
 
     def _lay_out_cards(self, models: list[ModelInfo]) -> None:
-        """Create cards for the given models and arrange in a 2-col grid."""
         self._clear_cards_grid()
 
         for index, model in enumerate(models):
@@ -124,55 +133,46 @@ class ComparisonView(QWidget):
         self._cards_grid.setColumnStretch(0, 1)
         self._cards_grid.setColumnStretch(1, 1)
 
-    # ----------------------------------------------------------------------
-    # Event handlers — user actions
-    # ----------------------------------------------------------------------
+    # ---------- Run dispatch ----------
 
     def _on_run_requested(
         self,
         prompt: str,
         model_ids: list,
-        file_paths: list,
     ) -> None:
-        """User clicked Run — lay out cards and dispatch real requests.
-
-        file_paths arrives from PromptArea as a list of strings (paths
-        serialized over the Qt signal). We convert back to Path objects
-        before handing off to the dispatcher.
-        """
+        """User clicked Run — fan out to selected models with checked files."""
         models = [m for m_id in model_ids if (m := get_model(m_id)) is not None]
         if not models:
             return
 
         self._lay_out_cards(models)
-
-        # Mark every card as loading immediately. The dispatcher will
-        # update cards as responses arrive (or as file uploads fail).
         for card in self._cards.values():
             card.set_loading()
 
-        # Convert string paths back to Path objects. PromptArea serializes
-        # them as strings because Qt signals don't always handle Path types
-        # cleanly across threads.
-        paths = [Path(p) for p in file_paths]
-
-        # Fire the real dispatcher with files. Responses arrive via signals.
-        self._dispatcher.dispatch(
-            prompt=prompt,
-            model_ids=model_ids,
-            file_paths=paths,
+        # Per-model: build pre-resolved file_refs from the library, since
+        # the files were already uploaded at attach time.
+        selected_ids: list[int] = (
+            self._file_panel.selected_file_ids() if self._file_panel else []
         )
 
-    # ----------------------------------------------------------------------
-    # Event handlers — dispatcher signals
-    # ----------------------------------------------------------------------
+        per_model_refs: dict[str, tuple[FileRef, ...]] = {}
+        for model in models:
+            provider_key = _PROVIDER_TO_LIBRARY_KEY.get(model.provider)
+            if provider_key is None or not selected_ids:
+                per_model_refs[model.id] = ()
+                continue
+            refs = self._file_library.get_refs_for_provider(selected_ids, provider_key)
+            per_model_refs[model.id] = tuple(refs)
 
-    def _on_response_received(
-        self,
-        model_id: str,
-        response: ChatResponse,
-    ) -> None:
-        """A provider returned a successful response."""
+        self._dispatcher.dispatch_with_resolved_refs(
+            prompt=prompt,
+            model_ids=model_ids,
+            per_model_refs=per_model_refs,
+        )
+
+    # ---------- Dispatcher signal handlers ----------
+
+    def _on_response_received(self, model_id: str, response: ChatResponse) -> None:
         card = self._cards.get(model_id)
         if card is None:
             return
@@ -184,22 +184,17 @@ class ComparisonView(QWidget):
         )
 
     def _on_response_failed(self, model_id: str, message: str) -> None:
-        """A provider call failed."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.set_error(message)
 
     def _on_all_complete(self) -> None:
-        """Every dispatched request has settled — award winner badges."""
         self._maybe_award_badges()
 
-    # ----------------------------------------------------------------------
-    # Badge logic
-    # ----------------------------------------------------------------------
+    # ---------- Badges ----------
 
     def _maybe_award_badges(self) -> None:
-        """Highlight fastest / cheapest / etc among completed cards."""
         complete_cards = [
             card for card in self._cards.values()
             if card._state.value == "complete"
@@ -228,11 +223,8 @@ class ComparisonView(QWidget):
             if cheapest is not fastest:
                 cheapest.set_badge("CHEAPEST", accent=True)
         except (ValueError, IndexError):
-            # Metric text was in unexpected format; skip badging rather
-            # than crash. Rare edge case but defensive.
             pass
 
     def _on_card_voted(self, model_id: str, is_positive: bool) -> None:
-        """Placeholder — later this will log to analytics."""
         direction = "up" if is_positive else "down"
         print(f"[vote] {model_id}: {direction}")
