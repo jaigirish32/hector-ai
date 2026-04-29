@@ -18,8 +18,10 @@ from PySide6.QtWidgets import (
 from attachments.file_library import FileLibrary
 from widgets.file_library_panel import FileLibraryPanel
 from widgets.nav_button import NavButton
+from paths import resource_path
 
-LOGO_PATH = Path(__file__).parent.parent / "assets" / "logo.png"
+
+LOGO_PATH = resource_path("assets/logo.png")
 
 
 class Sidebar(QWidget):

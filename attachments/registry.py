@@ -10,8 +10,16 @@ The registry is local-only — never makes network calls. It's a cache
 that lets the dispatcher answer "have we already uploaded this file
 to this provider, and is the upload still valid?"
 
-Database location: `<project_root>/hector.db` for now. Will move to
-`%APPDATA%\\HECTOR-AI\\hector.db` when we package for distribution.
+Database location:
+    The SQLite file lives in the OS-correct per-user app-data folder
+    (e.g. %APPDATA%\\HECTOR-AI\\hector.db on Windows). The path is
+    resolved lazily at FileRegistry.__init__ time via paths.user_data_dir,
+    NOT at module import time — Qt's QStandardPaths needs QApplication
+    to exist, and the registry is only ever constructed after main.py
+    has set up the app.
+
+    Callers can still pass an explicit db_path to the constructor (used
+    by tests). If no path is given, the user-data location is used.
 """
 from __future__ import annotations
 
@@ -21,10 +29,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from paths import user_data_dir
 
-# Database lives in the project root for development. Switch to
-# user app-data folder when packaging.
-DB_PATH = Path(__file__).resolve().parent.parent / "hector.db"
+
+# Filename for the registry database inside the user-data directory.
+# Constant rather than a full path because the directory is OS-dependent
+# and resolved at runtime — see FileRegistry.__init__.
+_DB_FILENAME = "hector.db"
 
 
 @dataclass(frozen=True)
@@ -53,15 +64,26 @@ class FileRegistry:
 
     Open one instance per app session. The connection is owned by the
     registry; methods are thread-safe via SQLite's serialized mode.
+
+    Default database location is the OS-correct per-user app-data dir
+    (resolved at construction time via paths.user_data_dir). Tests can
+    override by passing an explicit db_path.
     """
 
-    def __init__(self, db_path: Path = DB_PATH) -> None:
-        self._db_path = db_path
+    def __init__(self, db_path: Path | None = None) -> None:
+        # Resolve the DB path. When db_path is None (production use),
+        # we ask paths.user_data_dir for the right place — that helper
+        # creates the directory on demand, so the SQLite open below
+        # won't fail with "no such file or directory" on first launch.
+        if db_path is None:
+            db_path = user_data_dir() / _DB_FILENAME
+
+        self._db_path = Path(db_path)
         # check_same_thread=False: we'll access from worker threads.
         # SQLite serializes access internally as long as no transaction
         # is held across thread boundaries (which we never do).
         self._conn = sqlite3.connect(
-            str(db_path),
+            str(self._db_path),
             check_same_thread=False,
             isolation_level=None,  # autocommit; explicit transactions for writes
         )
