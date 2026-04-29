@@ -68,7 +68,9 @@ class ResponseCard(QFrame):
 
         self.setObjectName("card")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMaximumHeight(420)
 
+        
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -82,6 +84,7 @@ class ResponseCard(QFrame):
         self._body.setObjectName("responseBody")
         self._body.setReadOnly(True)
         self._body.setMinimumHeight(140)
+        self._body.setMaximumHeight(280)
         self._body.setPlaceholderText("Waiting for prompt...")
         root.addWidget(self._body, stretch=1)
 

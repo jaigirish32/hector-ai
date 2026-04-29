@@ -1,11 +1,28 @@
 """
 OpenAI client — calls api.openai.com using the Responses API.
 
-File support: Responses API accepts uploaded files via `input_file`
-content blocks referencing the file_id returned by the Files API.
-We just inject one block per file before the user's text prompt.
+File support: Responses API has TWO content block types for files,
+chosen per file based on its MIME type:
 
-Migrated from Chat Completions in Phase 1; file support added in Phase 2.
+1. input_file — for documents (PDF, csv, txt, code, office).
+   Uploaded with purpose='user_data'. References the file by file_id.
+   The Responses API gates the file by FILENAME EXTENSION at chat time
+   against an allowlist of document extensions; image extensions like
+   .jpg/.jpeg/.png are NOT on this allowlist.
+
+2. input_image — for images (PNG, JPEG, GIF, WEBP).
+   Uploaded with purpose='vision'. References the file by file_id.
+   The two purposes are NOT interchangeable: a file uploaded as
+   'user_data' cannot be referenced via input_image, and a file
+   uploaded as 'vision' cannot be referenced via input_file.
+
+The shape is determined by the FileRef's MIME type at chat time. The
+registry stores the real MIME, so this client always sees the truth.
+
+Migrated from Chat Completions in Phase 1; document support added in
+Phase 2; image support fixed Apr 2026 (Phase 2f) when we discovered that
+images uploaded as user_data + referenced via input_file fail with an
+extension-allowlist error.
 """
 from __future__ import annotations
 
@@ -30,6 +47,18 @@ from providers.base import (
     calculate_cost_usd,
 )
 from settings_manager import SecretKey, SettingsManager
+
+
+# MIME types that are referenced via input_image content blocks. MUST
+# stay in sync with _OPENAI_IMAGE_MIMES in attachments/uploaders.py —
+# they describe the same set from two different sides (upload purpose
+# selection vs chat content block selection).
+_IMAGE_MIMES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+})
 
 
 class OpenAIClient(BaseProviderClient):
@@ -129,8 +158,14 @@ class OpenAIClient(BaseProviderClient):
         """Convert a ChatRequest into Responses API input format.
 
         Returns a list with one user message containing typed content
-        blocks: zero or more `input_file` blocks (one per attached file)
-        followed by an `input_text` block with the user's prompt.
+        blocks. For each Anthropic file_ref attached to this provider:
+
+          - Image MIMEs (PNG/JPEG/GIF/WEBP) emit:
+                {"type": "input_image", "file_id": "..."}
+          - Everything else emits:
+                {"type": "input_file", "file_id": "..."}
+
+        Followed by an `input_text` block with the user's prompt.
 
         Files come BEFORE the text — empirically, models follow context
         better when files appear ahead of the question being asked
@@ -141,10 +176,17 @@ class OpenAIClient(BaseProviderClient):
         for ref in request.file_refs:
             if ref.provider != "openai":
                 continue
-            content_blocks.append({
-                "type": "input_file",
-                "file_id": ref.remote_id,
-            })
+
+            if ref.mime_type in _IMAGE_MIMES:
+                content_blocks.append({
+                    "type": "input_image",
+                    "file_id": ref.remote_id,
+                })
+            else:
+                content_blocks.append({
+                    "type": "input_file",
+                    "file_id": ref.remote_id,
+                })
 
         content_blocks.append({
             "type": "input_text",

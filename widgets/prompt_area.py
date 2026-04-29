@@ -55,8 +55,8 @@ class PromptArea(QFrame):
         self._prompt_input.setPlaceholderText(
             "Ask HECTOR anything. Check files in the sidebar to include them."
         )
-        self._prompt_input.setMinimumHeight(80)
-        self._prompt_input.setMaximumHeight(160)
+        self._prompt_input.setMinimumHeight(60)
+        self._prompt_input.setMaximumHeight(120)
         self._prompt_input.textChanged.connect(self._update_char_counter)
         root.addWidget(self._prompt_input)
 

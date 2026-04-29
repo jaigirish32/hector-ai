@@ -11,6 +11,12 @@ HECTOR runs every request against multiple providers in parallel for
 side-by-side comparison. The router does not pick "the best provider" —
 the user already picked their providers via the UI chips. The router
 answers a per-provider capability question for the file at hand.
+
+A provider is "supported" if its strategy in the matrix is in
+SUPPORTED_STRATEGIES (currently NATIVE or NATIVE_VIA_CODE_EXEC).
+The two differ in *how* the provider's chat client consumes the file
+(document block vs container_upload block) but both mean "the file
+gets to this provider and is usable."
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ from enum import Enum
 from routing.capability_matrix import (
     Capability,
     KNOWN_PROVIDERS,
-    Strategy,
+    SUPPORTED_STRATEGIES,
     lookup,
 )
 from routing.mime_canonical import canonical_mime
@@ -120,10 +126,11 @@ def route(
             ))
             continue
 
-        # 3. Look up the capability. UNSUPPORTED is the default for
-        # any (provider, mime) combination not explicitly listed.
+        # 3. Look up the capability. Anything not in SUPPORTED_STRATEGIES
+        # (i.e. UNSUPPORTED, or any future non-supported strategy) means
+        # this provider doesn't natively handle this file type.
         cap = lookup(provider, canonical)
-        if cap.strategy != Strategy.NATIVE:
+        if cap.strategy not in SUPPORTED_STRATEGIES:
             skipped.append(SkippedProvider(
                 name=provider,
                 reason=SkipReason.NOT_NATIVE,

@@ -8,6 +8,24 @@ Each uploader has the same interface:
 The dispatcher picks the right uploader based on which provider it's
 calling. This file only handles the upload/delete mechanics — caching
 of upload results in SQLite is the file orchestrator's job.
+
+Per-provider quirks handled in this module:
+
+  Anthropic + office formats (xlsx/xls/docx/doc/pptx/ppt):
+      Uploaded as anonymous bytes (filename 'blob.bin', MIME
+      'application/octet-stream'). Real filename/MIME tracked in
+      HECTOR's registry and surfaced to Claude as text metadata at
+      chat time (see providers/anthropic_client.py). PDFs and images
+      keep their real filename/MIME because the document/image content
+      blocks need real types. Empirically verified Apr 2026.
+
+  OpenAI + image formats (PNG, JPEG):
+      Uploaded with purpose='vision' instead of the 'user_data' default
+      used for documents. Per OpenAI docs, images referenced in chat as
+      input_image content blocks must have been uploaded with the vision
+      purpose; user_data uploads cannot be referenced via input_image and
+      input_file rejects image extensions. Documents continue to use
+      'user_data'.
 """
 from __future__ import annotations
 
@@ -82,6 +100,25 @@ class BaseUploader:
 
 ANTHROPIC_FILES_BETA = "files-api-2025-04-14"
 
+# Office formats that Anthropic only accepts via code execution (not via
+# the standard 'document' content block). These get uploaded as anonymous
+# bytes — filename 'blob.bin', MIME 'application/octet-stream' — because
+# this is the path empirically verified to work with container_upload +
+# code execution. MUST stay in sync with _OFFICE_MIMES in
+# providers/anthropic_client.py — they describe the same set from two
+# different sides (upload vs chat).
+_ANTHROPIC_OFFICE_MIMES = frozenset({
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",   # xlsx
+    "application/vnd.ms-excel",                                            # xls
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
+    "application/msword",                                                  # doc
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+    "application/vnd.ms-powerpoint",                                       # ppt
+})
+
+_ANTHROPIC_ANON_FILENAME = "blob.bin"
+_ANTHROPIC_ANON_MIME = "application/octet-stream"
+
 
 class AnthropicUploader(BaseUploader):
     provider_name = "anthropic"
@@ -105,10 +142,21 @@ class AnthropicUploader(BaseUploader):
         if not path.exists():
             raise ProviderError(f"File not found: {path}")
 
+        # Decide wire format. Office types go up as anonymous bytes; PDFs
+        # and images keep their real filename and MIME. The decision is
+        # made here (in the uploader) rather than at the call site because
+        # it's a provider-specific quirk, not a HECTOR-level concept.
+        if mime_type in _ANTHROPIC_OFFICE_MIMES:
+            wire_filename = _ANTHROPIC_ANON_FILENAME
+            wire_mime = _ANTHROPIC_ANON_MIME
+        else:
+            wire_filename = path.name
+            wire_mime = mime_type
+
         try:
             with open(path, "rb") as fh:
                 response = client.beta.files.upload(
-                    file=(path.name, fh, mime_type),
+                    file=(wire_filename, fh, wire_mime),
                     extra_headers={"anthropic-beta": ANTHROPIC_FILES_BETA},
                 )
         except AnthropicAuthError as exc:
@@ -138,12 +186,15 @@ class AnthropicUploader(BaseUploader):
                 raw=str(exc),
             ) from exc
 
+        # Always store the REAL filename and size in the result, even
+        # when we sent anonymous bytes. The registry uses these for the
+        # user-facing file name and for the metadata prompt at chat time.
         return ProviderUploadResult(
             provider=self.provider_name,
             remote_id=response.id,
             expires_at=None,
-            raw_filename=getattr(response, "filename", path.name),
-            size_bytes=getattr(response, "size_bytes", path.stat().st_size),
+            raw_filename=path.name,
+            size_bytes=int(getattr(response, "size_bytes", 0) or path.stat().st_size),
         )
 
     def delete(self, remote_id: str) -> None:
@@ -324,7 +375,39 @@ class GeminiUploader(BaseUploader):
 
 # ---------- OpenAI uploader ----------
 
-OPENAI_FILE_PURPOSE = "user_data"
+# Default purpose for documents (PDFs, csvs, code, text, spreadsheets).
+# OpenAI's Responses API references these via input_file content blocks.
+_OPENAI_DOCUMENT_PURPOSE = "user_data"
+
+# Purpose for images (PNG, JPEG, GIF, WEBP). OpenAI's Responses API
+# references these via input_image content blocks. Files uploaded with
+# 'user_data' purpose CANNOT be used as input_image — the file_id is
+# rejected at chat time. Conversely, files uploaded with 'vision' purpose
+# cannot be used as input_file. The two purposes are not interchangeable.
+_OPENAI_VISION_PURPOSE = "vision"
+
+# MIME types that should be uploaded with the vision purpose. Per OpenAI
+# vision docs (Apr 2026): PNG, JPEG, GIF, WEBP. HECTOR's matrix today
+# routes only PNG and JPEG, but the set here is wider so future matrix
+# rows for GIF/WEBP work without code changes.
+_OPENAI_IMAGE_MIMES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+})
+
+
+def _openai_purpose_for(mime_type: str) -> str:
+    """Return the OpenAI Files API purpose to use for a given MIME type.
+
+    Images need 'vision'; everything else uses 'user_data'. The choice is
+    permanent for the file: OpenAI files cannot be re-purposed after
+    upload, so we have to get this right the first time.
+    """
+    if mime_type in _OPENAI_IMAGE_MIMES:
+        return _OPENAI_VISION_PURPOSE
+    return _OPENAI_DOCUMENT_PURPOSE
 
 
 class OpenAIUploader(BaseUploader):
@@ -349,11 +432,17 @@ class OpenAIUploader(BaseUploader):
         if not path.exists():
             raise ProviderError(f"File not found: {path}")
 
+        # Pick the correct purpose for OpenAI based on file type. Images
+        # MUST go up as 'vision'; documents MUST go up as 'user_data'.
+        # The right choice depends on how the chat client will reference
+        # the file later — input_image vs input_file content blocks.
+        purpose = _openai_purpose_for(mime_type)
+
         try:
             with open(path, "rb") as fh:
                 response = client.files.create(
                     file=fh,
-                    purpose=OPENAI_FILE_PURPOSE,
+                    purpose=purpose,
                 )
         except OpenAIAuthError as exc:
             raise AuthenticationError(
