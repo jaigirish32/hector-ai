@@ -9,6 +9,10 @@ dependencies = [
     "google-genai>=1.73.1",
     "keyring>=25.7.0",
     "openai>=2.32.0",
-    "pypdf>=6.10.2",
     "pyside6>=6.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
 ]
