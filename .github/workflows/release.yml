@@ -1,0 +1,218 @@
+# GitHub Actions workflow for HECTOR-AI release builds.
+#
+# What this does:
+#   When a tag matching v* (e.g. v0.1.0, v1.2.3-beta) is pushed, this
+#   workflow runs two jobs in parallel:
+#     1. build-windows — produces HECTOR-AI-windows.zip
+#     2. build-macos   — produces HECTOR-AI-macos.dmg
+#   Both artefacts are then attached to a GitHub Release for that tag.
+#
+# What this does NOT do:
+#   - Code signing / notarisation (would need a code-signing cert for
+#     Windows ~$300/yr and an Apple Developer account ~$99/yr). Without
+#     these, users see SmartScreen warnings on Windows and Gatekeeper
+#     warnings on macOS. They can be bypassed but it's friction.
+#   - Build for Intel Macs (we use macos-latest = Apple Silicon only).
+#     Confirmed appropriate for the client's M4 MacBook Air.
+#   - Run on every push to main (only on tag push). Catches breakage at
+#     release time only. Trade-off was deliberate.
+#
+# How to trigger a release:
+#     git tag v0.1.0
+#     git push origin v0.1.0
+#
+# How to retry a failed build:
+#     Delete the failed release and tag from GitHub UI, then re-tag and
+#     push. Or use the workflow_dispatch trigger below to rerun manually.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # workflow_dispatch lets us trigger from the Actions UI without a tag.
+  # Useful for testing the workflow itself before committing to a real
+  # release tag. Won't create a GitHub Release (release upload step skips).
+  workflow_dispatch:
+
+# Required for the upload-release step to attach files to the release.
+permissions:
+  contents: write
+
+jobs:
+  # =====================================================================
+  # Windows build
+  # =====================================================================
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Pin uv version for reproducibility. Bump deliberately, not by
+          # accident. Loose pins on build tools cause "worked yesterday,
+          # broken today" surprises.
+          version: "0.5.x"
+          # Cache uv's package cache between runs. Faster subsequent
+          # builds without affecting correctness.
+          enable-cache: true
+
+      - name: Set up Python
+        # uv can install its own Python; we let it do so to match what
+        # would happen on a fresh dev machine. The .python-version file
+        # in the repo (pinning 3.12) is honoured.
+        run: uv python install 3.12
+
+      - name: Sync dependencies (frozen)
+        # --frozen tells uv to use uv.lock as-is and FAIL if the lock
+        # would need updating. This is the reproducibility guarantee:
+        # the runner installs exactly what your local dev box has.
+        run: uv sync --frozen
+
+      - name: Build with PyInstaller
+        # Same command you run locally. The spec file handles all the
+        # platform-specific logic (the BUNDLE block is skipped on
+        # Windows because sys.platform != "darwin").
+        run: uv run pyinstaller hector.spec
+
+      - name: Verify build output
+        # Sanity check before packaging — fail loudly if PyInstaller
+        # didn't produce the expected exe. Otherwise the zip step
+        # silently produces a broken artefact.
+        shell: pwsh
+        run: |
+          $exe = "dist/HECTOR-AI/HECTOR-AI.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Expected $exe not found after PyInstaller build"
+            exit 1
+          }
+          $info = Get-Item $exe
+          Write-Host "Built: $($info.FullName) ($($info.Length) bytes)"
+
+      - name: Package as zip
+        shell: pwsh
+        run: |
+          $zip = "HECTOR-AI-windows.zip"
+          Compress-Archive -Path dist/HECTOR-AI/* -DestinationPath $zip -Force
+          $info = Get-Item $zip
+          Write-Host "Packaged: $($info.FullName) ($([math]::Round($info.Length/1MB,1)) MB)"
+
+      - name: Upload as workflow artefact
+        # Always upload to workflow run artefacts, even on workflow_dispatch
+        # (manual run, no tag). Useful for debugging without creating
+        # a release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: HECTOR-AI-windows
+          path: HECTOR-AI-windows.zip
+          retention-days: 30
+
+      - name: Attach to release
+        # Only runs on tag push (skipped on workflow_dispatch).
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HECTOR-AI-windows.zip
+          # generate_release_notes pulls commit messages between this
+          # tag and the previous release. Decent default; can be
+          # overridden by editing the release on GitHub afterwards.
+          generate_release_notes: true
+          # If the release for this tag already exists (e.g. macOS job
+          # finished first and created it), append to it rather than
+          # erroring.
+          fail_on_unmatched_files: true
+
+  # =====================================================================
+  # macOS build
+  # =====================================================================
+  build-macos:
+    name: Build macOS
+    # macos-latest is currently macOS 14 on Apple Silicon (ARM64).
+    # Produces an ARM-only binary. Confirmed correct for client's M4.
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.5.x"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen
+
+      - name: Build with PyInstaller
+        # On macOS, the spec's BUNDLE block produces dist/HECTOR-AI.app
+        # in addition to dist/HECTOR-AI/.
+        run: uv run pyinstaller hector.spec
+
+      - name: Verify build output
+        run: |
+          set -e
+          if [ ! -d "dist/HECTOR-AI.app" ]; then
+            echo "ERROR: Expected dist/HECTOR-AI.app not found after PyInstaller build"
+            ls -la dist/ || true
+            exit 1
+          fi
+          echo "Built: $(du -sh dist/HECTOR-AI.app | cut -f1) — dist/HECTOR-AI.app"
+
+      - name: Strip quarantine attributes
+        # macOS adds com.apple.quarantine xattr to anything downloaded
+        # or built in CI. Stripping at build time avoids the user
+        # hitting a Gatekeeper "damaged app" dialog on first launch.
+        # (Note: this does NOT bypass the unsigned-app warning. That
+        # still appears for unsigned builds; users right-click → Open.)
+        run: |
+          xattr -cr dist/HECTOR-AI.app
+
+      - name: Package as DMG
+        # hdiutil is built into macOS — no install needed. Produces a
+        # functional but unstyled .dmg. We can switch to create-dmg
+        # later for a polished look (drag-to-Applications layout,
+        # custom background, etc.) once the pipeline is verified.
+        run: |
+          set -e
+          DMG_NAME="HECTOR-AI-macos.dmg"
+          STAGING_DIR="dmg-staging"
+
+          # Stage the .app and an Applications symlink so users can drag
+          # the app into Applications when they mount the dmg.
+          mkdir -p "$STAGING_DIR"
+          cp -R dist/HECTOR-AI.app "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          hdiutil create \
+            -volname "HECTOR-AI" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_NAME"
+
+          ls -lh "$DMG_NAME"
+
+      - name: Upload as workflow artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HECTOR-AI-macos
+          path: HECTOR-AI-macos.dmg
+          retention-days: 30
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HECTOR-AI-macos.dmg
+          generate_release_notes: true
+          fail_on_unmatched_files: true
