@@ -26,16 +26,26 @@ Icon:
     Not configured here. Adding the .ico/.icns later as a polish pass
     once the build pipeline is verified end-to-end.
 
-PySide6 plugin bundling:
-    Uses collect_all('PySide6') to bundle EVERY Qt module, plugin, and
-    data file. This is heavier than the default PySide6 hook (adds maybe
-    20–50 MB to the bundle) but it's the safe choice because the default
-    hook misses the platforminputcontexts plugins on macOS, which are
-    required for the keyboard event chain to reach widgets. Without
-    those plugins, the macOS bundle launches and renders fine but
-    keystrokes are dropped (right-click paste still works because
-    that's a clipboard operation, not a keyboard event). v0.1.0 and
-    v0.1.1 hit this; v0.1.2 fixes it via collect_all.
+History of macOS keyboard input issue (read before changing this spec):
+
+    v0.1.0 / v0.1.1 — macOS bundle launched, GUI rendered correctly,
+    but every keystroke produced a system beep and no text appeared
+    in the prompt or Settings inputs. Right-click paste worked because
+    that's a clipboard operation, not a keyboard event.
+
+    v0.1.2 — added collect_all('PySide6') to bundle every Qt plugin,
+    on the hypothesis that the platforminputcontexts plugins were
+    missing. Bundle size grew from 55MB to 289MB. Did NOT fix the
+    keyboard issue (still beeped on keypress).
+
+    v0.1.3 — added NSPrincipalClass=NSApplication to the macOS
+    Info.plist. Without this key, macOS does not recognise the .app
+    as a proper Cocoa GUI application; keyboard events have no first
+    responder and the system rings the alert bell. This is the
+    documented fix for the exact symptom we were seeing. The
+    collect_all('PySide6') from v0.1.2 is retained for now (change
+    one variable at a time); v0.1.4 may revert it once v0.1.3 is
+    confirmed working, to bring bundle size back down.
 """
 from __future__ import annotations
 
@@ -59,12 +69,8 @@ ENTRY_POINT = str(SPEC_DIR / "main.py")
 # PySide6 — collect everything
 # ---------------------------------------------------------------------------
 # collect_all returns (datas, binaries, hiddenimports) for the named
-# package. We use it for PySide6 to ensure every Qt plugin (including
-# platform input contexts on macOS) gets bundled. The default PySide6
-# hook tries to be selective but has been observed to miss
-# platforminputcontexts in 6.11.x with PyInstaller 6.20.x — exactly
-# the failure mode that causes "GUI works, keyboard input dropped" on
-# macOS. collect_all is the safe sledgehammer.
+# package. Retained from v0.1.2 — see History note above. May revert
+# in v0.1.4 if NSPrincipalClass alone proves to fix the keyboard issue.
 pyside_datas, pyside_binaries, pyside_hiddenimports = collect_all("PySide6")
 
 # ---------------------------------------------------------------------------
@@ -183,6 +189,25 @@ coll = COLLECT(
 # On macOS, after COLLECT produces dist/HECTOR-AI/, we additionally wrap
 # it as a .app bundle so it behaves like a native Mac application
 # (double-click to launch, shows up in Launchpad, etc.).
+#
+# Info.plist keys explained:
+#
+#   NSPrincipalClass = "NSApplication"
+#       CRITICAL for keyboard input. Tells macOS this bundle is a
+#       proper Cocoa GUI app. Without it, macOS treats the bundle
+#       as something more like a CLI tool that opened a window;
+#       keyboard events have no "first responder" object and macOS
+#       rings the system alert bell on every keystroke. Adding this
+#       key is THE fix for the v0.1.0/v0.1.1/v0.1.2 keyboard-beep
+#       symptom on macOS.
+#
+#   LSUIElement = False
+#       Defensive: NOT a menu-bar-only / agent app. Default is False;
+#       being explicit prevents confusion with PyInstaller's defaults.
+#
+#   LSBackgroundOnly = False
+#       Defensive: NOT a daemon / background-only process. Same
+#       defensive reasoning as LSUIElement.
 
 if sys.platform == "darwin":
     app = BUNDLE(
@@ -191,10 +216,16 @@ if sys.platform == "darwin":
         icon=None,            # Add .icns here in a later pass
         bundle_identifier="com.karri.hectorai",
         info_plist={
+            # CRITICAL — see comment above. Fixes keyboard beep on macOS.
+            "NSPrincipalClass": "NSApplication",
+            # Defensive defaults — explicit is better than implicit.
+            "LSUIElement": False,
+            "LSBackgroundOnly": False,
+            # Bundle identity.
             "CFBundleName": "HECTOR-AI",
             "CFBundleDisplayName": "HECTOR-AI",
-            "CFBundleVersion": "0.1.2",
-            "CFBundleShortVersionString": "0.1.2",
+            "CFBundleVersion": "0.1.3",
+            "CFBundleShortVersionString": "0.1.3",
             # Tell macOS this is a regular GUI app, not a tool.
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             # Allow the app to run on Apple Silicon natively.

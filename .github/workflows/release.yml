@@ -17,6 +17,14 @@
 #   - Run on every push to main (only on tag push). Catches breakage at
 #     release time only. Trade-off was deliberate.
 #
+# v0.1.3 additions:
+#   - macOS keyboard smoke test step (after build, before dmg packaging):
+#     launches the .app on the runner, injects keystrokes via osascript,
+#     screenshots before/after. Best-effort diagnostic — the runner may
+#     not have the display/permissions for keystroke injection to work,
+#     in which case the screenshot is inconclusive but the build still
+#     proceeds. Artefacts are uploaded for inspection.
+#
 # How to trigger a release:
 #     git tag v0.1.0
 #     git push origin v0.1.0
@@ -172,10 +180,98 @@ jobs:
         # macOS adds com.apple.quarantine xattr to anything downloaded
         # or built in CI. Stripping at build time avoids the user
         # hitting a Gatekeeper "damaged app" dialog on first launch.
-        # (Note: this does NOT bypass the unsigned-app warning. That
-        # still appears for unsigned builds; users right-click → Open.)
+        # NOTE: this does NOT prevent the user from needing to run
+        # xattr -cr on first download — macOS re-applies quarantine
+        # when the .dmg is downloaded via browser. Documented in the
+        # client install instructions.
         run: |
           xattr -cr dist/HECTOR-AI.app
+
+      - name: Inspect macOS bundle for keyboard-input plugins
+        # Diagnostic step — verifies that collect_all('PySide6') from
+        # hector.spec actually included the platforminputcontexts plugins
+        # in the bundle. If they're absent, the keyboard fix from v0.1.2
+        # didn't take effect at all and v0.1.3's NSPrincipalClass change
+        # would also be working in vain.
+        run: |
+          echo "=== Plugin directories present in bundle ==="
+          find dist/HECTOR-AI.app -type d \( -name "platforms" -o -name "platforminputcontexts" -o -name "imageformats" -o -name "iconengines" \) 2>/dev/null | head -30
+          echo ""
+          echo "=== Input context plugin files ==="
+          find dist/HECTOR-AI.app -path "*platforminputcontexts*" 2>/dev/null
+          echo ""
+          echo "=== Bundle Info.plist (key entries for keyboard input) ==="
+          plutil -p dist/HECTOR-AI.app/Contents/Info.plist | grep -iE "NSPrincipalClass|LSUIElement|LSBackgroundOnly|CFBundleVersion" || true
+          echo ""
+          echo "=== Bundle size ==="
+          du -sh dist/HECTOR-AI.app
+
+      - name: Smoke test keyboard input on the runner
+        # Best-effort runtime test: launch the .app, inject keystrokes
+        # via osascript, screenshot before & after to compare. The
+        # GitHub macOS runner may or may not have the display/TCC
+        # permissions needed for this to produce a meaningful result,
+        # so this step is non-blocking — `true` at the end always
+        # exits zero. The screenshots are uploaded as workflow
+        # artefacts for human inspection regardless.
+        run: |
+          set +e  # don't abort on individual command failures
+          
+          # Launch the app in the background.
+          /usr/bin/open dist/HECTOR-AI.app
+          
+          # Give it time to launch and reach idle GUI state. macOS
+          # apps from PyInstaller are a bit slower to start than
+          # native ones because of Python interpreter init.
+          sleep 12
+          
+          # Verify the process is actually running.
+          if ! pgrep -f "HECTOR-AI" > /dev/null; then
+            echo "WARNING: HECTOR-AI process not found after launch attempt"
+            echo "(this is non-fatal; build continues)"
+          else
+            echo "Process found - app launched"
+          fi
+          
+          # Take a "before keystroke" screenshot. -x suppresses the
+          # camera shutter sound and improves headless reliability.
+          screencapture -x /tmp/before_keystroke.png 2>&1 | head -5 || \
+            echo "screencapture (before) failed - runner may be headless"
+          
+          # Try to focus the app.
+          osascript -e 'tell application "HECTOR-AI" to activate' 2>&1 | head -5 || \
+            echo "activate command failed - app may not be registered"
+          sleep 2
+          
+          # Inject the test keystroke. Requires Accessibility permission;
+          # may silently fail on the runner if not granted.
+          osascript -e 'tell application "System Events" to keystroke "test123"' 2>&1 | head -5 || \
+            echo "keystroke injection failed - runner may lack Accessibility permission"
+          sleep 2
+          
+          # Capture the result.
+          screencapture -x /tmp/after_keystroke.png 2>&1 | head -5 || \
+            echo "screencapture (after) failed"
+          
+          # File size sanity check on the screenshots.
+          ls -la /tmp/before_keystroke.png /tmp/after_keystroke.png 2>&1 || \
+            echo "no screenshots produced"
+          
+          # Always succeed — this is diagnostic, not gating.
+          true
+
+      - name: Upload diagnostic screenshots
+        # Run regardless of whether the smoke test produced screenshots.
+        # if-no-files-found: warn means an empty artefact upload is OK
+        # (we just won't have anything to look at, which itself is a
+        # signal that the runner can't render).
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-keyboard-diagnostic
+          path: /tmp/*_keystroke.png
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Package as DMG
         # hdiutil is built into macOS — no install needed. Produces a
