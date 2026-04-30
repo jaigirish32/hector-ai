@@ -25,11 +25,24 @@ Console:
 Icon:
     Not configured here. Adding the .ico/.icns later as a polish pass
     once the build pipeline is verified end-to-end.
+
+PySide6 plugin bundling:
+    Uses collect_all('PySide6') to bundle EVERY Qt module, plugin, and
+    data file. This is heavier than the default PySide6 hook (adds maybe
+    20–50 MB to the bundle) but it's the safe choice because the default
+    hook misses the platforminputcontexts plugins on macOS, which are
+    required for the keyboard event chain to reach widgets. Without
+    those plugins, the macOS bundle launches and renders fine but
+    keystrokes are dropped (right-click paste still works because
+    that's a clipboard operation, not a keyboard event). v0.1.0 and
+    v0.1.1 hit this; v0.1.2 fixes it via collect_all.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_all
 
 
 # ---------------------------------------------------------------------------
@@ -43,16 +56,28 @@ SPEC_DIR = Path(SPECPATH).resolve()
 ENTRY_POINT = str(SPEC_DIR / "main.py")
 
 # ---------------------------------------------------------------------------
+# PySide6 — collect everything
+# ---------------------------------------------------------------------------
+# collect_all returns (datas, binaries, hiddenimports) for the named
+# package. We use it for PySide6 to ensure every Qt plugin (including
+# platform input contexts on macOS) gets bundled. The default PySide6
+# hook tries to be selective but has been observed to miss
+# platforminputcontexts in 6.11.x with PyInstaller 6.20.x — exactly
+# the failure mode that causes "GUI works, keyboard input dropped" on
+# macOS. collect_all is the safe sledgehammer.
+pyside_datas, pyside_binaries, pyside_hiddenimports = collect_all("PySide6")
+
+# ---------------------------------------------------------------------------
 # Bundled data files
 # ---------------------------------------------------------------------------
-# The `datas` list is pairs of (source, destination_subdir). At runtime
-# these end up under sys._MEIPASS, which is what paths.resource_path()
-# already knows how to look in.
+# Project-specific data goes here. PySide6's data files come in via
+# pyside_datas (above) and get merged into Analysis.datas below.
 
 datas = [
     # (src_relative_to_spec, dest_dir_in_bundle)
     ("assets", "assets"),
 ]
+datas.extend(pyside_datas)
 
 # ---------------------------------------------------------------------------
 # Hidden imports
@@ -79,6 +104,7 @@ hiddenimports = [
     "win32ctypes.pywin32.pywintypes",
     "win32ctypes.pywin32.win32cred",
 ]
+hiddenimports.extend(pyside_hiddenimports)
 
 # ---------------------------------------------------------------------------
 # Excludes
@@ -103,7 +129,7 @@ excludes = [
 a = Analysis(
     [ENTRY_POINT],
     pathex=[str(SPEC_DIR)],
-    binaries=[],
+    binaries=pyside_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -167,8 +193,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "HECTOR-AI",
             "CFBundleDisplayName": "HECTOR-AI",
-            "CFBundleVersion": "0.1.0",
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleVersion": "0.1.2",
+            "CFBundleShortVersionString": "0.1.2",
             # Tell macOS this is a regular GUI app, not a tool.
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             # Allow the app to run on Apple Silicon natively.
