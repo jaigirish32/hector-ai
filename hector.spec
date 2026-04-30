@@ -26,33 +26,36 @@ Icon:
     Not configured here. Adding the .ico/.icns later as a polish pass
     once the build pipeline is verified end-to-end.
 
-History of macOS keyboard input issue (read before changing this spec):
+History of macOS keyboard input issue (READ BEFORE CHANGING):
 
     v0.1.0 / v0.1.1 — macOS bundle launched, GUI rendered correctly,
     but every keystroke produced a system beep and no text appeared
     in the prompt or Settings inputs. Right-click paste worked because
     that's a clipboard operation, not a keyboard event.
 
-    v0.1.2 — added collect_all('PySide6') to bundle every Qt plugin,
-    on the hypothesis that the platforminputcontexts plugins were
-    missing. Bundle size grew from 55MB to 289MB. Did NOT fix the
-    keyboard issue (still beeped on keypress).
+    v0.1.2 — added collect_all('PySide6') on the wrong hypothesis that
+    the platforminputcontexts plugins were missing. Bundle size grew
+    from ~55MB to ~289MB. Did NOT fix the keyboard issue.
 
     v0.1.3 — added NSPrincipalClass=NSApplication to the macOS
     Info.plist. Without this key, macOS does not recognise the .app
     as a proper Cocoa GUI application; keyboard events have no first
-    responder and the system rings the alert bell. This is the
-    documented fix for the exact symptom we were seeing. The
-    collect_all('PySide6') from v0.1.2 is retained for now (change
-    one variable at a time); v0.1.4 may revert it once v0.1.3 is
-    confirmed working, to bring bundle size back down.
+    responder and the system rings the alert bell. THIS WAS THE FIX.
+    Verified working by the client on a real Apple Silicon M4
+    MacBook Air running Sequoia 15.7.3.
+
+    v0.1.4 — reverts the v0.1.2 collect_all('PySide6') change. Since
+    NSPrincipalClass was the actual fix, the aggressive PySide6
+    bundling is no longer needed. Bundle size returns to roughly
+    v0.1.1 levels (~55MB Windows, ~80MB macOS). The default PyInstaller
+    PySide6 hook is sufficient for HECTOR's Qt usage (QtCore, QtGui,
+    QtWidgets, QtNetwork). Also retains the v0.1.3 NSPrincipalClass
+    + defensive Info.plist defaults — those stay forever.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-from PyInstaller.utils.hooks import collect_all
 
 
 # ---------------------------------------------------------------------------
@@ -66,24 +69,15 @@ SPEC_DIR = Path(SPECPATH).resolve()
 ENTRY_POINT = str(SPEC_DIR / "main.py")
 
 # ---------------------------------------------------------------------------
-# PySide6 — collect everything
-# ---------------------------------------------------------------------------
-# collect_all returns (datas, binaries, hiddenimports) for the named
-# package. Retained from v0.1.2 — see History note above. May revert
-# in v0.1.4 if NSPrincipalClass alone proves to fix the keyboard issue.
-pyside_datas, pyside_binaries, pyside_hiddenimports = collect_all("PySide6")
-
-# ---------------------------------------------------------------------------
 # Bundled data files
 # ---------------------------------------------------------------------------
-# Project-specific data goes here. PySide6's data files come in via
-# pyside_datas (above) and get merged into Analysis.datas below.
+# Project-specific data goes here. PySide6's data files are handled by
+# PyInstaller's default PySide6 hook (no explicit handling needed in v0.1.4+).
 
 datas = [
     # (src_relative_to_spec, dest_dir_in_bundle)
     ("assets", "assets"),
 ]
-datas.extend(pyside_datas)
 
 # ---------------------------------------------------------------------------
 # Hidden imports
@@ -110,7 +104,6 @@ hiddenimports = [
     "win32ctypes.pywin32.pywintypes",
     "win32ctypes.pywin32.win32cred",
 ]
-hiddenimports.extend(pyside_hiddenimports)
 
 # ---------------------------------------------------------------------------
 # Excludes
@@ -135,7 +128,7 @@ excludes = [
 a = Analysis(
     [ENTRY_POINT],
     pathex=[str(SPEC_DIR)],
-    binaries=pyside_binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -198,8 +191,9 @@ coll = COLLECT(
 #       as something more like a CLI tool that opened a window;
 #       keyboard events have no "first responder" object and macOS
 #       rings the system alert bell on every keystroke. Adding this
-#       key is THE fix for the v0.1.0/v0.1.1/v0.1.2 keyboard-beep
-#       symptom on macOS.
+#       key was THE fix for the v0.1.0/v0.1.1/v0.1.2 keyboard-beep
+#       symptom on macOS. Verified working in v0.1.3 by the client
+#       on real M4 hardware.
 #
 #   LSUIElement = False
 #       Defensive: NOT a menu-bar-only / agent app. Default is False;
@@ -224,8 +218,8 @@ if sys.platform == "darwin":
             # Bundle identity.
             "CFBundleName": "HECTOR-AI",
             "CFBundleDisplayName": "HECTOR-AI",
-            "CFBundleVersion": "0.1.3",
-            "CFBundleShortVersionString": "0.1.3",
+            "CFBundleVersion": "0.1.4",
+            "CFBundleShortVersionString": "0.1.4",
             # Tell macOS this is a regular GUI app, not a tool.
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             # Allow the app to run on Apple Silicon natively.

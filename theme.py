@@ -276,6 +276,40 @@ def _build_stylesheet() -> str:
     QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
         background: transparent;
     }}
+
+    /* ===== Context menus (right-click Cut/Copy/Paste etc.) =====
+       Without explicit QMenu rules, the global `*` rule's color leaked
+       into Qt's default menu, and on macOS the system menu background
+       defaults to white — light text on white = invisible items until
+       hovered. These rules force a dark background everywhere.
+       v0.1.4 added this section.
+    */
+    QMenu {{
+        background-color: {c.BG_CARD};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        padding: 4px 0;
+    }}
+    QMenu::item {{
+        background-color: transparent;
+        color: {c.TEXT_PRIMARY};
+        padding: 6px 24px 6px 16px;
+        font-size: 13px;
+    }}
+    QMenu::item:selected {{
+        background-color: {c.BG_CARD_HOVER};
+        color: {c.TEXT_PRIMARY};
+    }}
+    QMenu::item:disabled {{
+        color: {c.TEXT_TERTIARY};
+    }}
+    QMenu::separator {{
+        height: 1px;
+        background-color: {c.BORDER};
+        margin: 4px 8px;
+    }}
+
     /* ===== Settings view — header ===== */
     QFrame#settingsHeader {{
         background-color: {c.BG_SIDEBAR};
