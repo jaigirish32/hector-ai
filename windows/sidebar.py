@@ -21,7 +21,7 @@ from widgets.nav_button import NavButton
 from paths import resource_path
 
 
-LOGO_PATH = resource_path("assets/logo.png")
+LOGO_PATH = resource_path("assets/logo.jpeg")
 
 
 class Sidebar(QWidget):

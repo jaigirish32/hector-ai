@@ -21,8 +21,7 @@ dist/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# uv
-uv.lock      # opinion: many projects DO commit this; uncomment to commit
+
 .python-version
 
 # ============================================================

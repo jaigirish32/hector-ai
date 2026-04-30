@@ -16,7 +16,7 @@ def main() -> None:
 
     # Icon is optional — silently skip if the asset isn't present (dev
     # checkouts where assets/ hasn't been added, or stripped builds).
-    icon_path = resource_path("assets/logo.png")
+    icon_path = resource_path("assets/logo.jpeg")
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 
