@@ -38,6 +38,7 @@ class Colors:
     GOLD_HOVER = "#00E6D5"
     GOLD_DARK = "#007D74"
     GOLD_TEXT_ON = "#042926"
+    BRAND_GOLD = "#D4AF37"
 
     # Semantic — status colors
     SUCCESS = "#4ADE80"
@@ -105,9 +106,9 @@ def _build_stylesheet() -> str:
         padding-left: 4px;
     }}
     QLabel#brandFooter {{
-        color: {c.TEXT_TERTIARY};
-        font-size: 10px;
-        font-style: italic;
+    color: {c.BRAND_GOLD};
+    font-size: 14px;
+    font-weight: 500;
     }}
 
     /* ===== Nav buttons (sidebar items) ===== */
