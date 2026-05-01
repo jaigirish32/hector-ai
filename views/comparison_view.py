@@ -123,7 +123,6 @@ class ComparisonView(QWidget):
 
         for index, model in enumerate(models):
             card = ResponseCard(model)
-            card.voted.connect(self._on_card_voted)
             self._cards[model.id] = card
 
             row = index // 2
@@ -230,7 +229,3 @@ class ComparisonView(QWidget):
                 cheapest.set_badge("CHEAPEST", accent=True)
         except (ValueError, IndexError):
             pass
-
-    def _on_card_voted(self, model_id: str, is_positive: bool) -> None:
-        direction = "up" if is_positive else "down"
-        print(f"[vote] {model_id}: {direction}")

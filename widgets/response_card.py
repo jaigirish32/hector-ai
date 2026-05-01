@@ -7,7 +7,9 @@ State machine:
     COMPLETE -> response received, card shows content + metrics
     ERROR    -> request failed, card shows the error message
 
-Supports 'up' / 'down' voting which a future analytics layer can log.
+A copy-to-clipboard button in the header copies the response body.
+The button is enabled only in the COMPLETE state and shows a brief
+checkmark confirmation when clicked.
 
 Caveats: when set_response is called with caveats (e.g. "this provider
 only saw 1 of 2 attached files"), they appear in italic grey text
@@ -16,7 +18,8 @@ are present and in non-COMPLETE states.
 """
 from enum import Enum
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -54,8 +57,6 @@ PROVIDER_COLORS = {
 class ResponseCard(QFrame):
     """Visual card for one provider's response in a comparison run."""
 
-    # Fires when the user votes — payload = (model_id, is_positive).
-    voted = Signal(str, bool)
 
     # Fires when the user clicks the regenerate button — payload = model_id.
     regenerate_requested = Signal(str)
@@ -153,10 +154,21 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(False)
         layout.addWidget(self._status_badge)
 
+        # Copy button — copies the response body to clipboard.
+        # Enabled only in COMPLETE state. Shows a checkmark for
+        # ~1.5s after click as confirmation, then reverts.
+        self._copy_button = QPushButton("⧉")
+        self._copy_button.setObjectName("copyButton")
+        self._copy_button.setFixedSize(28, 28)
+        self._copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._copy_button.setToolTip("Copy response to clipboard")
+        self._copy_button.clicked.connect(self._on_copy)
+        layout.addWidget(self._copy_button)
+
         return header
 
     def _build_footer(self) -> QWidget:
-        """Footer strip: latency / tokens / cost / vote buttons."""
+        """Footer strip: latency / tokens / cost metrics."""
         footer = QFrame()
         footer.setObjectName("cardFooter")
 
@@ -172,22 +184,6 @@ class ResponseCard(QFrame):
         layout.addWidget(self._tokens_metric)
         layout.addWidget(self._cost_metric)
         layout.addStretch()
-
-        # Vote buttons
-        self._vote_up = QPushButton("↑")
-        self._vote_up.setObjectName("vote")
-        self._vote_up.setFixedSize(26, 22)
-        self._vote_up.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._vote_up.clicked.connect(lambda: self._on_vote(True))
-
-        self._vote_down = QPushButton("↓")
-        self._vote_down.setObjectName("vote")
-        self._vote_down.setFixedSize(26, 22)
-        self._vote_down.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._vote_down.clicked.connect(lambda: self._on_vote(False))
-
-        layout.addWidget(self._vote_up)
-        layout.addWidget(self._vote_down)
 
         return footer
 
@@ -307,11 +303,31 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Enable/disable vote buttons based on whether a response exists."""
+        """Enable/disable copy button based on whether a response exists."""
         is_complete = self._state == CardState.COMPLETE
-        self._vote_up.setEnabled(is_complete)
-        self._vote_down.setEnabled(is_complete)
+        self._copy_button.setEnabled(is_complete)
 
-    def _on_vote(self, is_positive: bool) -> None:
-        """Emit the voted signal with model id and direction."""
-        self.voted.emit(self._model.id, is_positive)
+    def _on_copy(self) -> None:
+        """Copy the response body to the system clipboard.
+
+        Shows a brief checkmark confirmation on the button by setting
+        a dynamic 'copied' property that the QSS rule keys off, then
+        schedules a revert after 1500ms via QTimer.singleShot.
+        """
+        text = self._body.toPlainText()
+        if not text:
+            return
+        QGuiApplication.clipboard().setText(text)
+        self._copy_button.setText("✓")
+        self._copy_button.setProperty("copied", True)
+        # Re-polish so the QSS [copied="true"] selector takes effect.
+        self._copy_button.style().unpolish(self._copy_button)
+        self._copy_button.style().polish(self._copy_button)
+        QTimer.singleShot(1500, self._revert_copy_icon)
+
+    def _revert_copy_icon(self) -> None:
+        """Restore the copy button to its default appearance."""
+        self._copy_button.setText("⧉")
+        self._copy_button.setProperty("copied", False)
+        self._copy_button.style().unpolish(self._copy_button)
+        self._copy_button.style().polish(self._copy_button)
