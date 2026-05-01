@@ -74,17 +74,16 @@ def _machine_password() -> bytes:
 
 
 def _derive_key() -> bytes:
-    """Derive the Fernet encryption key from machine identity."""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,  # Fernet wants 32 bytes
-        salt=_KDF_SALT,
-        iterations=_KDF_ITERATIONS,
-    )
-    raw_key = kdf.derive(_machine_password())
-    # Fernet expects URL-safe base64-encoded 32-byte key.
-    import base64
-    return base64.urlsafe_b64encode(raw_key)
+    """Return a fixed encryption key.
+
+    DEBUG: Hardcoded key for testing the encryption pipeline.
+    Once we confirm the read/write/decrypt cycle works across app
+    restarts, we'll replace this with a proper machine-derived
+    or generated-and-stored key.
+    """
+    # Fernet expects a URL-safe base64-encoded 32-byte key.
+    # Generated once with: Fernet.generate_key()
+    return b"hZmKqLZmTbXNvJsRkPdYwQfGcVeWaUiOmKnJhFdSgRk="
 
 
 def _secrets_path() -> Path:
