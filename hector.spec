@@ -92,17 +92,19 @@ datas = [
 # on both Windows and Mac builds.
 
 hiddenimports = [
-    # keyring backends — keyring picks one at runtime by OS
-    "keyring.backends.Windows",
-    "keyring.backends.macOS",
-    "keyring.backends.SecretService",
-    "keyring.backends.fail",
-    "keyring.backends.chainer",
-    "keyring.backends.null",
-    # win32ctypes — keyring's Windows credential vault dependency
-    "win32ctypes.pywin32",
-    "win32ctypes.pywin32.pywintypes",
-    "win32ctypes.pywin32.win32cred",
+    # Qt SVG support — needed for inline SVG icons in response cards.
+    # The default PySide6 hook sometimes misses this, especially on
+    # macOS PyInstaller builds.
+    "PySide6.QtSvg",
+    # cryptography — Fernet encryption for secrets storage.
+    "cryptography",
+    "cryptography.fernet",
+    "cryptography.hazmat.primitives",
+    "cryptography.hazmat.primitives.hashes",
+    "cryptography.hazmat.primitives.kdf.pbkdf2",
+    "cryptography.hazmat.backends",
+    "cryptography.hazmat.backends.openssl",
+    "cryptography.hazmat.bindings._rust",
 ]
 
 # ---------------------------------------------------------------------------
@@ -218,8 +220,8 @@ if sys.platform == "darwin":
             # Bundle identity.
             "CFBundleName": "HECTOR-AI",
             "CFBundleDisplayName": "HECTOR-AI",
-            "CFBundleVersion": "0.1.5",
-            "CFBundleShortVersionString": "0.1.5",
+            "CFBundleVersion": "0.1.7",
+            "CFBundleShortVersionString": "0.1.7",
             # Tell macOS this is a regular GUI app, not a tool.
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             # Allow the app to run on Apple Silicon natively.

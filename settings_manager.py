@@ -1,24 +1,33 @@
 """
 Settings storage for HECTOR-AI.
 
-API keys go to the OS credential vault via the `keyring` library
-(Windows Credential Manager / macOS Keychain / Linux Secret Service).
+API keys go to an encrypted file in the per-user data directory,
+managed by the EncryptedStorage class. Encryption uses Fernet (AES)
+with a key derived from machine-stable identifiers, so the file is
+unreadable if copied to a different machine.
+
 Non-secret preferences go to QSettings (standard OS preferences location).
 
 This module is deliberately UI-free — any view can use it, and we can
 swap the storage backend later without touching the UI.
+
+Migration note: prior versions used the OS keyring (Windows Credential
+Manager / macOS Keychain). v0.1.6 onward uses the encrypted file.
+There is no automatic migration — users on v0.1.5 or earlier will
+need to re-enter their API keys once on first launch of v0.1.6+.
+Old keychain entries are harmless and can be deleted manually.
 """
 from __future__ import annotations
 
-import keyring
 from PySide6.QtCore import QSettings
 
+from encrypted_storage import EncryptedStorage
 from models import DEFAULT_MODELS, Provider
 
 
-# Service name under which all our secrets are stored in the OS vault.
-# This is what shows up if the user opens Windows Credential Manager.
-KEYRING_SERVICE = "HECTOR-AI"
+# Note: KEYRING_SERVICE is no longer used — kept here briefly for
+# reference in case any external code expects it. Will be removed
+# in a future version. Storage now uses EncryptedStorage (see import).
 
 
 # Per-provider secrets we track. Each is stored as a separate entry
@@ -39,7 +48,10 @@ class SettingsManager:
     def __init__(self) -> None:
         # QSettings uses app/org names from main.py — same ones you set earlier.
         self._qsettings = QSettings()
-
+        # Encrypted file storage for secrets. Lazy-loads on first read,
+        # writes through to disk on every change. No OS prompts, no
+        # cross-platform behavior differences.
+        self._storage = EncryptedStorage()
     # ------------------------------------------------------------------
     # Secret storage (API keys, endpoints) — OS credential vault
     # ------------------------------------------------------------------
@@ -47,10 +59,10 @@ class SettingsManager:
     def get_secret(self, key: str) -> str:
         """Return a stored secret, or '' if never set."""
         try:
-            value = keyring.get_password(KEYRING_SERVICE, key)
-            return value if value else ""
+            return self._storage.get(key)
         except Exception:
-            # On rare OS errors, fail soft — return empty rather than crash.
+            # On rare I/O or decryption errors, fail soft — return empty
+            # rather than crash. The user can re-enter their keys.
             return ""
 
     def set_secret(self, key: str, value: str) -> None:
@@ -59,18 +71,18 @@ class SettingsManager:
             self.delete_secret(key)
             return
         try:
-            keyring.set_password(KEYRING_SERVICE, key, value)
+            self._storage.set(key, value)
         except Exception as exc:
-            raise SettingsError(f"Could not save to credential vault: {exc}")
+            raise SettingsError(f"Could not save secret: {exc}")
+
 
     def delete_secret(self, key: str) -> None:
         """Remove a stored secret. Safe to call if the secret isn't set."""
         try:
-            keyring.delete_password(KEYRING_SERVICE, key)
-        except keyring.errors.PasswordDeleteError:
-            # Already gone — fine.
-            pass
+            self._storage.delete(key)
         except Exception:
+            # Best-effort delete. If it fails, the worst case is the
+            # value is still in the file — caller should not crash.
             pass
 
     def has_secret(self, key: str) -> bool:

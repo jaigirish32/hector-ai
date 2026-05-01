@@ -1,13 +1,13 @@
 [project]
 name = "hector-ai"
-version = "0.1.5"
+version = "0.1.7"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.97.0",
+    "cryptography>=42.0.0",
     "google-genai>=1.73.1",
-    "keyring>=25.7.0",
     "openai>=2.32.0",
     "pyside6>=6.11.0",
 ]
