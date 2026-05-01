@@ -256,6 +256,172 @@ def _build_stylesheet() -> str:
         border: 1px solid {c.GOLD_DARK};
     }}
 
+    /* ===== Dialog / popup styling (QDialog, QMessageBox) =====
+       Same problem as the QMenu issue documented above: without
+       explicit rules, popups inherit the global `*` rule's color
+       (light) but get the OS-default background (white on macOS).
+       Result: dark text on white = unreadable error dialogs.
+
+       These rules apply to every QDialog and QMessageBox in the
+       app — confirmation dialogs (delete a file), error popups
+       (upload failed), warnings, info boxes. They cascade to
+       QLabel and QPushButton inside the dialog so we don't have
+       to style each child separately. v0.1.9 added this section.
+    */
+    QDialog, QMessageBox {{
+        background-color: {c.BG_CARD};
+        color: {c.TEXT_PRIMARY};
+    }}
+    QDialog QLabel, QMessageBox QLabel {{
+        background-color: transparent;
+        color: {c.TEXT_PRIMARY};
+        font-size: 13px;
+    }}
+    QMessageBox QPushButton {{
+        background-color: {c.BG_INPUT};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        padding: 6px 18px;
+        font-size: 12px;
+        font-weight: 500;
+        min-width: 70px;
+    }}
+    QMessageBox QPushButton:hover {{
+        background-color: {c.BG_CARD_HOVER};
+        border: 1px solid {c.BORDER_HOVER};
+    }}
+    QMessageBox QPushButton:default {{
+        background-color: {c.GOLD};
+        color: {c.GOLD_TEXT_ON};
+        border: 1px solid {c.GOLD_DARK};
+    }}
+    QMessageBox QPushButton:default:hover {{
+        background-color: {c.GOLD_HOVER};
+    }}
+
+    /* ===== Tooltips =====
+       Tooltips appear on hover (Run button, copy button, file chips).
+       macOS defaults to a yellow-ish background that clashes with
+       the dark theme. Force dark surfaces here too.
+    */
+    QToolTip {{
+        background-color: {c.BG_CARD};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 11px;
+    }}
+
+    /* ===== Defensive: standard form controls =====
+       These widgets might appear in current or future settings
+       dialogs, and they all have the same fall-through-to-system
+       behavior on macOS. Pre-empting the bug rather than waiting
+       to be bitten by it.
+    */
+    QComboBox {{
+        background-color: {c.BG_INPUT};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        padding: 5px 10px;
+        font-size: 13px;
+    }}
+    QComboBox:hover {{
+        border: 1px solid {c.BORDER_HOVER};
+    }}
+    QComboBox QAbstractItemView {{
+        background-color: {c.BG_CARD};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        selection-background-color: {c.BG_CARD_HOVER};
+    }}
+
+    QCheckBox, QRadioButton {{
+        color: {c.TEXT_PRIMARY};
+        font-size: 13px;
+        spacing: 8px;
+    }}
+    QCheckBox::indicator, QRadioButton::indicator {{
+        background-color: {c.BG_INPUT};
+        border: 1px solid {c.BORDER};
+        width: 16px;
+        height: 16px;
+    }}
+    QCheckBox::indicator {{
+        border-radius: 3px;
+    }}
+    QRadioButton::indicator {{
+        border-radius: 8px;
+    }}
+    QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
+        background-color: {c.GOLD};
+        border: 1px solid {c.GOLD_DARK};
+    }}
+
+    QSpinBox, QDoubleSpinBox {{
+        background-color: {c.BG_INPUT};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        padding: 5px 8px;
+        font-size: 13px;
+    }}
+
+    QGroupBox {{
+        background-color: transparent;
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 8px;
+        margin-top: 12px;
+        padding-top: 8px;
+    }}
+    QGroupBox::title {{
+        color: {c.TEXT_SECONDARY};
+        subcontrol-origin: margin;
+        left: 10px;
+        padding: 0 4px;
+        font-size: 11px;
+        font-weight: 600;
+    }}
+
+    QHeaderView::section {{
+        background-color: {c.BG_CARD};
+        color: {c.TEXT_SECONDARY};
+        border: 0;
+        border-bottom: 1px solid {c.BORDER};
+        padding: 6px 10px;
+        font-size: 11px;
+        font-weight: 600;
+    }}
+
+    QTableView, QListView, QTreeView {{
+        background-color: {c.BG_APP};
+        color: {c.TEXT_PRIMARY};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        selection-background-color: {c.BG_CARD_HOVER};
+        selection-color: {c.TEXT_PRIMARY};
+        outline: 0;
+    }}
+    QTableView::item, QListView::item, QTreeView::item {{
+        padding: 4px;
+    }}
+
+    QProgressBar {{
+        background-color: {c.BG_INPUT};
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        text-align: center;
+        color: {c.TEXT_PRIMARY};
+        font-size: 11px;
+    }}
+    QProgressBar::chunk {{
+        background-color: {c.GOLD};
+        border-radius: 5px;
+    }}
+
     /* ===== Scrollbars (subtle, minimal) ===== */
     QScrollBar:vertical {{
         background: transparent;
