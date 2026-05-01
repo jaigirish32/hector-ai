@@ -18,8 +18,9 @@ are present and in non-COMPLETE states.
 """
 from enum import Enum
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -32,6 +33,36 @@ from PySide6.QtWidgets import (
 )
 
 from models import ModelInfo, Provider
+
+
+# SVG icons for the copy button. Defined inline so we don't bundle
+# extra asset files and the icons render identically on every OS via
+# Qt's SVG renderer. The currentColor pattern means the icon picks
+# up its color from the surrounding stylesheet.
+_COPY_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+fill="none" stroke="#A0A0A0" stroke-width="2" stroke-linecap="round"
+stroke-linejoin="round">
+<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+</svg>"""
+
+_CHECK_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+fill="none" stroke="#00D4C4" stroke-width="2.5" stroke-linecap="round"
+stroke-linejoin="round">
+<polyline points="20 6 9 17 4 12"/>
+</svg>"""
+
+
+def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
+    """Render an SVG string into a QIcon at the requested pixel size."""
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    from PySide6.QtGui import QPainter
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class CardState(str, Enum):
@@ -154,12 +185,19 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(False)
         layout.addWidget(self._status_badge)
 
-        # Copy button — copies the response body to clipboard.
-        # Enabled only in COMPLETE state. Shows a checkmark for
-        # ~1.5s after click as confirmation, then reverts.
-        self._copy_button = QPushButton("⧉")
+       # Copy button — copies the response body to clipboard.
+        # Enabled only in COMPLETE state. Shows a checkmark icon for
+        # ~1.5s after click as confirmation, then reverts. Uses an
+        # inline SVG icon so it renders identically on Windows and
+        # macOS (avoids font-glyph fallback issues with Unicode
+        # symbols on macOS).
+        self._copy_icon_default = _svg_to_icon(_COPY_ICON_SVG, size=16)
+        self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
+
+        self._copy_button = QPushButton()
+        self._copy_button.setIcon(self._copy_icon_default)
         self._copy_button.setObjectName("copyButton")
-        self._copy_button.setFixedSize(28, 28)
+        self._copy_button.setFixedSize(32, 28)
         self._copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._copy_button.setToolTip("Copy response to clipboard")
         self._copy_button.clicked.connect(self._on_copy)
@@ -310,24 +348,17 @@ class ResponseCard(QFrame):
     def _on_copy(self) -> None:
         """Copy the response body to the system clipboard.
 
-        Shows a brief checkmark confirmation on the button by setting
-        a dynamic 'copied' property that the QSS rule keys off, then
-        schedules a revert after 1500ms via QTimer.singleShot.
+        Shows a brief checkmark confirmation on the button by swapping
+        to the check SVG icon, then schedules a revert after 1500ms
+        via QTimer.singleShot.
         """
         text = self._body.toPlainText()
         if not text:
             return
         QGuiApplication.clipboard().setText(text)
-        self._copy_button.setText("✓")
-        self._copy_button.setProperty("copied", True)
-        # Re-polish so the QSS [copied="true"] selector takes effect.
-        self._copy_button.style().unpolish(self._copy_button)
-        self._copy_button.style().polish(self._copy_button)
+        self._copy_button.setIcon(self._copy_icon_done)
         QTimer.singleShot(1500, self._revert_copy_icon)
 
     def _revert_copy_icon(self) -> None:
-        """Restore the copy button to its default appearance."""
-        self._copy_button.setText("⧉")
-        self._copy_button.setProperty("copied", False)
-        self._copy_button.style().unpolish(self._copy_button)
-        self._copy_button.style().polish(self._copy_button)
+        """Restore the copy button to its default icon."""
+        self._copy_button.setIcon(self._copy_icon_default)
