@@ -25,13 +25,8 @@ from encrypted_storage import EncryptedStorage
 from models import DEFAULT_MODELS, Provider
 
 
-# Note: KEYRING_SERVICE is no longer used — kept here briefly for
-# reference in case any external code expects it. Will be removed
-# in a future version. Storage now uses EncryptedStorage (see import).
-
-
 # Per-provider secrets we track. Each is stored as a separate entry
-# in the OS vault so they're independently rotatable.
+# in the encrypted file so they're independently rotatable.
 class SecretKey:
     OPENAI_API_KEY = "openai_api_key"
     AZURE_OPENAI_API_KEY = "azure_openai_api_key"
@@ -43,17 +38,46 @@ class SecretKey:
 
 
 class SettingsManager:
-    """Facade for all HECTOR-AI configuration storage."""
+    """Facade for all HECTOR-AI configuration storage.
+
+    Implemented as a process-wide singleton: every call to
+    SettingsManager() returns the same instance, sharing the same
+    EncryptedStorage and secret cache. This is critical because
+    multiple components (dispatcher, settings UI, file orchestrator,
+    provider clients) construct their own SettingsManager via the
+    convenient `or SettingsManager()` fallback pattern. Without the
+    singleton, each instance has its own in-memory cache and saves
+    in one don't propagate to others — leading to "Settings save
+    succeeds but next request still uses old key, until app restart"
+    bugs that we hit in v0.1.9.
+    """
+
+    # Class-level attribute holding the single instance. Must exist as
+    # a real attribute (not just an annotation) so __new__ can read it.
+    _instance = None
+
+    def __new__(cls) -> "SettingsManager":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def __init__(self) -> None:
+        # __init__ runs every time SettingsManager() is called, even
+        # though __new__ returns the same instance. Guard against
+        # re-initializing the storage (which would clear the cache
+        # and undo the singleton point).
+        if hasattr(self, "_initialized"):
+            return
+        self._initialized = True
+
         # QSettings uses app/org names from main.py — same ones you set earlier.
         self._qsettings = QSettings()
         # Encrypted file storage for secrets. Lazy-loads on first read,
-        # writes through to disk on every change. No OS prompts, no
-        # cross-platform behavior differences.
+        # writes through to disk on every change. Singleton-shared.
         self._storage = EncryptedStorage()
+
     # ------------------------------------------------------------------
-    # Secret storage (API keys, endpoints) — OS credential vault
+    # Secret storage (API keys, endpoints) — encrypted local file
     # ------------------------------------------------------------------
 
     def get_secret(self, key: str) -> str:
@@ -74,7 +98,6 @@ class SettingsManager:
             self._storage.set(key, value)
         except Exception as exc:
             raise SettingsError(f"Could not save secret: {exc}")
-
 
     def delete_secret(self, key: str) -> None:
         """Remove a stored secret. Safe to call if the secret isn't set."""

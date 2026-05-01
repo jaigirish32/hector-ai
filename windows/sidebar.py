@@ -117,7 +117,7 @@ class Sidebar(QWidget):
         brand.setObjectName("brandFooter")
         layout.addWidget(brand)
 
-        version = QLabel("v0.1.9  · Desktop")
+        version = QLabel("v0.1.10  · Desktop")
         version.setObjectName("brandFooter")
         layout.addWidget(version)
 
