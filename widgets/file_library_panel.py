@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -65,6 +66,7 @@ class _UploadWorker(QRunnable):
         try:
             outcome = self._library.add_file(self._path)
             self._signals.upload_finished.emit(outcome)
+            
         except Exception as exc:
             self._signals.failed.emit(f"Upload failed: {exc}")
 
@@ -100,6 +102,16 @@ class FileLibraryPanel(QWidget):
         self._rows: dict[int, _FileRow] = {}    # file_id -> row widget
         self._busy = False                       # blocks concurrent ops
 
+        # Upload queue. We process one file at a time to avoid SQLite
+        # race conditions in FileRegistry — its sqlite3.Connection is
+        # not thread-safe, and parallel writes corrupt cursor state
+        # producing random "tuple index out of range" /
+        # "NoneType has no attribute 'endswith'" errors. Serial uploads
+        # trade speed for reliability. Verified Apr 2026 with a 10-file
+        # repro that lost ~20% of uploads under parallel execution.
+        self._upload_queue: list[Path] = []
+
+
         self._signals = _LibraryWorkerSignals()
         self._signals.upload_finished.connect(self._on_upload_finished)
         self._signals.delete_finished.connect(self._on_delete_finished)
@@ -116,12 +128,40 @@ class FileLibraryPanel(QWidget):
         layout.addWidget(section_label)
         layout.addSpacing(2)
 
-        # Container for file rows
+        # Container for file rows. Wrapped in a QScrollArea so the
+        # FILES list scrolls when there are more files than fit in
+        # the sidebar's vertical space. Without this the rows stack
+        # off the bottom and either push the "+ Add file" button
+        # off-screen or get silently clipped — a real bug for users
+        # who upload many files. v0.1.11.
         self._rows_container = QWidget()
+        self._rows_container.setObjectName("filesRowsContainer")
         self._rows_layout = QVBoxLayout(self._rows_container)
         self._rows_layout.setContentsMargins(0, 0, 0, 0)
         self._rows_layout.setSpacing(2)
-        layout.addWidget(self._rows_container)
+        # AlignTop keeps rows packed at the top instead of stretching
+        # vertically when there are few files (avoids ugly gaps).
+        self._rows_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._rows_scroll = QScrollArea()
+        self._rows_scroll.setObjectName("filesRowsScroll")
+        self._rows_scroll.setWidgetResizable(True)
+        self._rows_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._rows_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        # Explicit ScrollBarAsNeeded — on macOS, leaving this default
+        # can result in the OS-managed floating overlay scroll bar that
+        # ignores our QSS styling. Forcing AsNeeded gives us Qt's
+        # styled scroll bar consistently across Windows and macOS.
+        self._rows_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self._rows_scroll.setWidget(self._rows_container)
+        # stretch=1 lets the scroll area absorb whatever vertical
+        # space the sidebar has, so the empty-state label and the
+        # "+ Add file" button below stay anchored at the bottom.
+        layout.addWidget(self._rows_scroll, stretch=1)
 
         # Empty-state label, shown when no files
         self._empty_label = QLabel("No files yet.")
@@ -188,7 +228,6 @@ class FileLibraryPanel(QWidget):
     def _on_add_clicked(self) -> None:
         if self._busy:
             return
-
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Add files to library",
@@ -197,14 +236,29 @@ class FileLibraryPanel(QWidget):
         )
         if not paths:
             return
-
-        # Upload each picked file in turn. We launch one worker per file
-        # to avoid blocking the UI during multi-file selection.
+        # Queue all picked paths and process them one at a time. The
+        # button stays disabled (via _set_busy) for the entire batch,
+        # so the user can't queue a second batch on top.
         self._set_busy(True)
         self._pending_uploads = len(paths)
-        for path_str in paths:
-            worker = _UploadWorker(self._library, Path(path_str), self._signals)
-            self._pool.start(worker)
+        self._upload_queue = [Path(p) for p in paths]
+        self._kick_next_upload()
+
+    def _kick_next_upload(self) -> None:
+        """Start the next queued upload, or finish the batch if empty.
+
+        Called from _on_add_clicked to start the first upload, and
+        from _on_upload_finished / _on_worker_failed to chain the
+        next one. Only one _UploadWorker runs at a time.
+        """
+        if not self._upload_queue:
+            # Batch complete. Re-enable the UI.
+            self._set_busy(False)
+            self._pending_uploads = 0
+            return
+        next_path = self._upload_queue.pop(0)
+        worker = _UploadWorker(self._library, next_path, self._signals)
+        self._pool.start(worker)
 
     def _on_delete_clicked(self, file_id: int) -> None:
         if self._busy:
@@ -236,69 +290,80 @@ class FileLibraryPanel(QWidget):
     # ---------- Worker callbacks ----------
 
     def _on_upload_finished(self, outcome: UploadOutcome) -> None:
-        self._pending_uploads -= 1
-        if self._pending_uploads <= 0:
-            self._set_busy(False)
-            self._pending_uploads = 0
+        # Wrap the whole body in try/finally so _kick_next_upload always
+        # runs regardless of which exit path the method takes (hard
+        # failure return, type-unsupported return, or normal completion).
+        # Without this, any early return leaves the queue stalled and
+        # the UI permanently busy.
+        try:
+            self._pending_uploads -= 1
+            # Don't clear busy state here — _kick_next_upload does it
+            # when the queue is finally empty.
 
-        filename = outcome.file_record.filename
-        n_success = len(outcome.successful_providers)
-        n_failed = len(outcome.failed_providers)
-        n_skipped = len(outcome.skipped_providers)
+            filename = outcome.file_record.filename
+            n_success = len(outcome.successful_providers)
+            n_failed = len(outcome.failed_providers)
+            n_skipped = len(outcome.skipped_providers)
 
-        # Hard failure: nothing succeeded AND nothing was skipped
-        # (so every provider tried and every provider errored).
-        if n_success == 0 and n_failed > 0 and n_skipped == 0:
-            QMessageBox.warning(
-                self,
-                "Upload failed",
-                f"Could not upload {filename} to any provider.\n\n"
-                + "\n".join(f"- {p}: {msg}" for p, msg in outcome.failed_providers.items()),
-            )
-            return
+            # Hard failure: nothing succeeded AND nothing was skipped
+            # (so every provider tried and every provider errored).
+            if n_success == 0 and n_failed > 0 and n_skipped == 0:
+                QMessageBox.warning(
+                    self,
+                    "Upload failed",
+                    f"Could not upload {filename} to any provider.\n\n"
+                    + "\n".join(f"- {p}: {msg}" for p, msg in outcome.failed_providers.items()),
+                )
+                return
 
-        # Hard wall: zero providers natively support this file type.
-        # Different message — retry won't fix it; user needs a different file or provider.
-        if n_success == 0 and n_failed == 0 and n_skipped > 0:
-            QMessageBox.warning(
-                self,
-                "File type not supported",
-                f"None of your configured providers natively support {filename}.\n\n"
-                "The file is in your library but cannot be used in chat. "
-                "Either configure a provider that supports this type, or use a "
-                "different file.",
-            )
+            # Hard wall: zero providers natively support this file type.
+            # Different message — retry won't fix it; user needs a
+            # different file or provider.
+            if n_success == 0 and n_failed == 0 and n_skipped > 0:
+                QMessageBox.warning(
+                    self,
+                    "File type not supported",
+                    f"None of your configured providers natively support {filename}.\n\n"
+                    "The file is in your library but cannot be used in chat. "
+                    "Either configure a provider that supports this type, or use a "
+                    "different file.",
+                )
+                self._refresh_from_library()
+                self.selection_changed.emit(self.selected_file_ids())
+                return
+
+            # Refresh the list from the registry to pick up the new row.
             self._refresh_from_library()
+            # Newly-added file is checked by default (refresh checks all).
             self.selection_changed.emit(self.selected_file_ids())
-            return
 
-        # Refresh the list from the registry to pick up the new row.
-        self._refresh_from_library()
-        # Newly-added file is checked by default (refresh checks all).
-        self.selection_changed.emit(self.selected_file_ids())
+            # Partial success — surface skipped providers and any upload
+            # failures in a single combined dialog so the user gets the
+            # full picture at a glance instead of two consecutive popups.
+            notes: list[str] = []
+            if n_skipped > 0:
+                skipped_names = ", ".join(sorted(outcome.skipped_providers.keys()))
+                notes.append(
+                    f"Not natively supported by: {skipped_names}. "
+                    f"These models will be unavailable for this file at Run time."
+                )
+            if n_failed > 0:
+                notes.append(
+                    "Upload errors:\n"
+                    + "\n".join(f"  - {p}: {msg}" for p, msg in outcome.failed_providers.items())
+                )
 
-        # Partial success — surface skipped providers and any upload failures.
-        # We combine them into one dialog so the user gets the full picture
-        # at a glance instead of two consecutive popups.
-        notes: list[str] = []
-        if n_skipped > 0:
-            skipped_names = ", ".join(sorted(outcome.skipped_providers.keys()))
-            notes.append(
-                f"Not natively supported by: {skipped_names}. "
-                f"These models will be unavailable for this file at Run time."
-            )
-        if n_failed > 0:
-            notes.append(
-                "Upload errors:\n"
-                + "\n".join(f"  - {p}: {msg}" for p, msg in outcome.failed_providers.items())
-            )
-
-        if notes:
-            QMessageBox.information(
-                self,
-                f"Added {filename}",
-                f"Uploaded to {n_success} provider(s).\n\n" + "\n\n".join(notes),
-            )
+            if notes:
+                QMessageBox.information(
+                    self,
+                    f"Added {filename}",
+                    f"Uploaded to {n_success} provider(s).\n\n" + "\n\n".join(notes),
+                )
+        finally:
+            # Always chain to the next queued upload, regardless of how
+            # this one ended (success, hard failure, type-unsupported).
+            # If the queue is empty, _kick_next_upload re-enables the UI.
+            self._kick_next_upload()
 
     def _on_delete_finished(self, outcome: DeleteOutcome) -> None:
         self._set_busy(False)
@@ -317,8 +382,13 @@ class FileLibraryPanel(QWidget):
         self.selection_changed.emit(self.selected_file_ids())
 
     def _on_worker_failed(self, message: str) -> None:
-        self._set_busy(False)
+        # Don't clear busy or stop the batch — _kick_next_upload
+        # handles that when the queue is empty. Show the error and
+        # continue with the next file. This way one bad PDF doesn't
+        # abort the whole batch.
         QMessageBox.critical(self, "Operation failed", message)
+        self._pending_uploads = max(0, self._pending_uploads - 1)
+        self._kick_next_upload()
 
 
 # ---------- One row per file ----------

@@ -47,7 +47,7 @@ from providers.base import (
     calculate_cost_usd,
 )
 from settings_manager import SecretKey, SettingsManager
-
+from providers._retry import with_rate_limit_retry
 
 # MIME types that are referenced via input_image content blocks. MUST
 # stay in sync with _OPENAI_IMAGE_MIMES in attachments/uploaders.py —
@@ -60,6 +60,42 @@ _IMAGE_MIMES = frozenset({
     "image/webp",
 })
 
+def _parse_openai_retry_after(exc: BaseException) -> int | None:
+    """Read the retry-after header from an OpenAI SDK exception.
+
+    OpenAI's RateLimitError inherits from APIStatusError which has
+    self.response (an httpx.Response). Same structure as Anthropic
+    but we keep the parser separate per provider so each can evolve
+    independently if SDK behavior diverges later.
+
+    Returns seconds to wait, or None if the header is missing or
+    unparseable — caller will fall back to exponential backoff.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    # Prefer milliseconds header if present.
+    ms_value = headers.get("retry-after-ms")
+    if ms_value:
+        try:
+            return max(1, int(float(ms_value)) // 1000)
+        except (TypeError, ValueError):
+            pass
+
+    # Standard retry-after in seconds.
+    seconds_value = headers.get("retry-after")
+    if seconds_value:
+        try:
+            return max(0, int(float(seconds_value)))
+        except (TypeError, ValueError):
+            pass
+
+    return None
 
 class OpenAIClient(BaseProviderClient):
     """Client for api.openai.com via the Responses API."""
@@ -105,17 +141,18 @@ class OpenAIClient(BaseProviderClient):
 
         start = time.monotonic()
         try:
-            response = client.responses.create(**create_kwargs)
+            response = with_rate_limit_retry(
+                fn=lambda: client.responses.create(**create_kwargs),
+                sdk_rate_limit_exception=OpenAIRateLimitError,
+                parse_retry_after_seconds=_parse_openai_retry_after,
+                provider_label="OpenAI",
+            )
         except OpenAIAuthError as exc:
             raise AuthenticationError(
                 "OpenAI rejected the API key. Check it's valid and has credit.",
                 raw=str(exc),
             ) from exc
-        except OpenAIRateLimitError as exc:
-            raise RateLimitError(
-                "OpenAI rate limit hit. Wait a moment and retry.",
-                raw=str(exc),
-            ) from exc
+       
         except APIConnectionError as exc:
             raise ProviderError(
                 "Could not reach OpenAI — check your internet connection.",

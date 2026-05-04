@@ -32,7 +32,36 @@ from providers.base import (
     calculate_cost_usd,
 )
 from settings_manager import SecretKey, SettingsManager
+from providers._retry import with_rate_limit_retry
 
+class _GeminiRateLimitMarker(Exception):
+    """Internal marker raised only when Gemini returns HTTP 429.
+
+    Why a private class:
+        Gemini's SDK raises a single generic genai_errors.APIError for
+        every HTTP status — 401, 429, 500, etc. The retry helper needs
+        to catch ONLY 429s, not all API errors. Telling the helper to
+        catch APIError directly would also retry auth and server errors
+        that will never succeed.
+
+        Instead, we wrap the API call, detect 429 via exc.code ourselves,
+        and re-raise as this marker. The helper catches the marker
+        specifically. All other Gemini errors propagate immediately
+        through the helper without retry.
+
+    This class never escapes this module — the retry helper consumes it
+    and either returns a successful response or raises base.RateLimitError
+    with the "rate limited after 3 retries" message.
+    """
+
+
+def _parse_gemini_retry_after(exc: BaseException) -> int | None:
+    """Gemini's SDK doesn't expose response headers on its exceptions,
+    so we can't read retry-after. Always returning None makes the retry
+    helper fall back to its exponential schedule (1s, 2s, 4s). Defined
+    as a real function instead of a lambda for clearer stack traces if
+    something does eventually go wrong here."""
+    return None
 
 class GeminiClient(BaseProviderClient):
     """Client for Google's Gemini models via aistudio API key."""
@@ -68,33 +97,59 @@ class GeminiClient(BaseProviderClient):
         config = genai_types.GenerateContentConfig(**config_kwargs)
 
         start = time.monotonic()
-        try:
-            response = client.models.generate_content(
-                model=request.model.api_model_name,
-                contents=contents,
-                config=config,
-            )
-        except genai_errors.APIError as exc:
-            status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            message = getattr(exc, "message", str(exc))
+        def _do_call():
+            """Inner function passed to the retry helper.
 
-            if status in (401, 403):
-                raise AuthenticationError(
-                    "Google rejected the API key. "
-                    "Check it at aistudio.google.com.",
+            Wraps the actual SDK call AND the error-classification logic,
+            because Gemini's lumped-together APIError needs to be split
+            into specific error types here. 429s become our private marker
+            (which the retry helper catches and retries); everything else
+            becomes a domain exception that propagates straight through
+            the helper without retry.
+            """
+            try:
+                return client.models.generate_content(
+                    model=request.model.api_model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except genai_errors.APIError as exc:
+                status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                message = getattr(exc, "message", str(exc))
+
+                if status in (401, 403):
+                    raise AuthenticationError(
+                        "Google rejected the API key. "
+                        "Check it at aistudio.google.com.",
+                        raw=str(exc),
+                    ) from exc
+                if status == 429:
+                    # Re-raise as our private marker so the retry helper
+                    # can catch it specifically. The helper either
+                    # eventually returns a successful response or raises
+                    # base.RateLimitError after 3 retries are exhausted.
+                    raise _GeminiRateLimitMarker(str(exc)) from exc
+                raise ProviderError(
+                    f"Gemini error: {message}",
                     raw=str(exc),
                 ) from exc
-            if status == 429:
-                raise RateLimitError(
-                    "Gemini rate limit hit. Free tier is 15 req/min on Flash. "
-                    "Wait a moment and retry.",
-                    raw=str(exc),
-                ) from exc
-            raise ProviderError(
-                f"Gemini error: {message}",
-                raw=str(exc),
-            ) from exc
+
+        try:
+            response = with_rate_limit_retry(
+                fn=_do_call,
+                sdk_rate_limit_exception=_GeminiRateLimitMarker,
+                parse_retry_after_seconds=_parse_gemini_retry_after,
+                provider_label="Gemini",
+            )
         except Exception as exc:
+            # Re-raise our domain exceptions cleanly; wrap unexpected ones.
+            from providers.base import (
+                AuthenticationError as _AuthErr,
+                ProviderError as _ProviderErr,
+                RateLimitError as _RateErr,
+            )
+            if isinstance(exc, (_AuthErr, _ProviderErr, _RateErr)):
+                raise
             raise ProviderError(
                 f"Unexpected error calling Gemini: {exc}",
                 raw=str(exc),

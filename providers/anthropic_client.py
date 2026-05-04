@@ -59,7 +59,7 @@ from providers.base import (
     calculate_cost_usd,
 )
 from settings_manager import SecretKey, SettingsManager
-
+from providers._retry import with_rate_limit_retry
 
 # Anthropic requires this beta header to accept content blocks that
 # reference uploaded file_ids (image, document, container_upload).
@@ -128,6 +128,43 @@ _MIME_TO_FRIENDLY: dict[str, tuple[str, str]] = {
         ("Legacy Microsoft PowerPoint presentation (.ppt)", "python-pptx"),
 }
 
+def _parse_anthropic_retry_after(exc: BaseException) -> int | None:
+    """Read the retry-after header from an Anthropic SDK exception.
+
+    Anthropic's RateLimitError inherits from APIStatusError which has
+    self.response (an httpx.Response). We read the standard retry-after
+    header from there. Returns seconds to wait, or None if the header
+    is missing or unparseable — caller will fall back to exponential
+    backoff in that case.
+
+    Anthropic also sometimes sends retry-after-ms (milliseconds, more
+    precise). We check that first when present.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    # Prefer milliseconds header if present.
+    ms_value = headers.get("retry-after-ms")
+    if ms_value:
+        try:
+            return max(1, int(float(ms_value)) // 1000)
+        except (TypeError, ValueError):
+            pass
+
+    # Standard retry-after in seconds.
+    seconds_value = headers.get("retry-after")
+    if seconds_value:
+        try:
+            return max(0, int(float(seconds_value)))
+        except (TypeError, ValueError):
+            pass
+
+    return None
 
 class AnthropicClient(BaseProviderClient):
     """Client for api.anthropic.com (Claude models)."""
@@ -182,16 +219,16 @@ class AnthropicClient(BaseProviderClient):
 
         start = time.monotonic()
         try:
-            response = client.messages.create(**create_kwargs)
+            response = with_rate_limit_retry(
+                fn=lambda: client.messages.create(**create_kwargs),
+                sdk_rate_limit_exception=AnthropicRateLimitError,
+                parse_retry_after_seconds=_parse_anthropic_retry_after,
+                provider_label="Anthropic",
+            )
         except AnthropicAuthError as exc:
             raise AuthenticationError(
                 "Anthropic rejected the API key. "
                 "Check it at console.anthropic.com and confirm you have credit.",
-                raw=str(exc),
-            ) from exc
-        except AnthropicRateLimitError as exc:
-            raise RateLimitError(
-                "Anthropic rate limit hit. Wait a moment and retry.",
                 raw=str(exc),
             ) from exc
         except APIConnectionError as exc:

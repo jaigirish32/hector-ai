@@ -30,13 +30,50 @@ from providers.base import (
     calculate_cost_usd,
 )
 from settings_manager import SecretKey, SettingsManager
-
+from providers._retry import with_rate_limit_retry
 
 # Responses API requires this version or later. Same minimum that
 # enabled the Responses endpoint plus the Files API integration we
 # verified during Phase 1.
 AZURE_API_VERSION = "2025-03-01-preview"
 
+def _parse_azure_retry_after(exc: BaseException) -> int | None:
+    """Read the retry-after header from an Azure OpenAI SDK exception.
+
+    Azure uses the OpenAI Python SDK so the exception structure is
+    identical: RateLimitError → APIStatusError → self.response (httpx).
+    Azure typically returns a `retry-after` header in seconds, but we
+    also check `retry-after-ms` defensively in case Azure's gateway
+    starts emitting milliseconds in the future.
+
+    Returns seconds to wait, or None if the header is missing or
+    unparseable — caller will fall back to exponential backoff.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+
+    # Prefer milliseconds header if present.
+    ms_value = headers.get("retry-after-ms")
+    if ms_value:
+        try:
+            return max(1, int(float(ms_value)) // 1000)
+        except (TypeError, ValueError):
+            pass
+
+    # Standard retry-after in seconds.
+    seconds_value = headers.get("retry-after")
+    if seconds_value:
+        try:
+            return max(0, int(float(seconds_value)))
+        except (TypeError, ValueError):
+            pass
+
+    return None
 
 class AzureOpenAIClient(BaseProviderClient):
     """Client for Azure-hosted OpenAI models via Responses API."""
@@ -101,17 +138,18 @@ class AzureOpenAIClient(BaseProviderClient):
 
         start = time.monotonic()
         try:
-            response = client.responses.create(**create_kwargs)
+            response = with_rate_limit_retry(
+                fn=lambda: client.responses.create(**create_kwargs),
+                sdk_rate_limit_exception=OpenAIRateLimitError,
+                parse_retry_after_seconds=_parse_azure_retry_after,
+                provider_label="Azure OpenAI",
+            )
         except OpenAIAuthError as exc:
             raise AuthenticationError(
                 "Azure rejected the API key. Check it's valid in Azure Portal.",
                 raw=str(exc),
             ) from exc
-        except OpenAIRateLimitError as exc:
-            raise RateLimitError(
-                "Azure rate limit hit. Wait a moment and retry.",
-                raw=str(exc),
-            ) from exc
+        
         except APIConnectionError as exc:
             raise ProviderError(
                 "Could not reach Azure OpenAI — check your endpoint URL "
