@@ -15,7 +15,7 @@ from attachments.file_library import FileLibrary
 from views.comparison_view import ComparisonView
 from views.settings_view import SettingsView
 from windows.sidebar import Sidebar
-
+from PySide6.QtGui import QCloseEvent
 
 class MainWindow(QMainWindow):
     """The top-level window. Holds a sidebar and a stack of views."""
@@ -59,3 +59,20 @@ class MainWindow(QMainWindow):
     def _on_view_changed(self, index: int) -> None:
         if 0 <= index < self.content_stack.count():
             self.content_stack.setCurrentIndex(index)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Cancel any in-flight LLM workers before the window closes.
+
+        Without this, workers can emit signals to a destroyed dispatcher
+        during teardown, producing 'Signal source has been deleted'
+        errors and potentially hanging the Python process. The
+        dispatcher's shutdown() cancels workers, waits up to 3s for
+        clean exit, then disconnects signals.
+
+        We delegate to ComparisonView.shutdown() rather than reaching
+        into its private _dispatcher directly — keeps encapsulation
+        clean, lets ComparisonView add other shutdown work later if it
+        ever owns more state.
+        """
+        self.comparison_view.shutdown()
+        super().closeEvent(event)

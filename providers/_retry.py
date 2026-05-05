@@ -27,6 +27,7 @@ from typing import Callable, TypeVar
 
 from providers.base import RateLimitError
 
+from providers._dbg import dbg
 
 T = TypeVar("T")
 
@@ -66,25 +67,31 @@ def with_rate_limit_retry(
     """
     last_sdk_exc: BaseException | None = None
 
-    for attempt in range(_MAX_RETRIES + 1):  # 0, 1, 2, 3 → 4 total tries
+    for attempt in range(_MAX_RETRIES + 1):
+        dbg("RETRY", f"{provider_label} attempt {attempt}/{_MAX_RETRIES} starting")
         try:
-            return fn()
+            result = fn()
+            dbg("RETRY", f"{provider_label} attempt {attempt} SUCCESS")
+            return result
         except sdk_rate_limit_exception as exc:
+            dbg("RETRY", f"{provider_label} attempt {attempt} got SDK RateLimit")
             last_sdk_exc = exc
             if attempt == _MAX_RETRIES:
-                # Out of retries — surface the final failure.
+                dbg("RETRY", f"{provider_label} retries EXHAUSTED, raising")
                 raise RateLimitError(
                     f"{provider_label} rate limited after {_MAX_RETRIES} retries.",
                     raw=str(exc),
                 ) from exc
 
-            # Decide how long to wait. Prefer the provider's retry-after
-            # header (most accurate), else exponential fallback.
             wait_seconds = parse_retry_after_seconds(exc)
+            dbg("RETRY", f"{provider_label} parser returned wait={wait_seconds}")
             if wait_seconds is None or wait_seconds < 0:
                 wait_seconds = _FALLBACK_WAITS[attempt]
+                dbg("RETRY", f"{provider_label} using fallback wait={wait_seconds}s")
 
+            dbg("RETRY", f"{provider_label} sleeping for {wait_seconds}s")
             time.sleep(wait_seconds)
+            dbg("RETRY", f"{provider_label} sleep done, looping to next attempt")
 
     # Unreachable — the loop either returns or raises. Defensive raise
     # in case Python's flow analysis ever needs it.

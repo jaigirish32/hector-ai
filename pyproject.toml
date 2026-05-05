@@ -8,6 +8,7 @@ dependencies = [
     "anthropic>=0.97.0",
     "cryptography>=42.0.0",
     "google-genai>=1.73.1",
+    "markdown>=3.10.2",
     "openai>=2.32.0",
     "pyside6>=6.11.0",
 ]

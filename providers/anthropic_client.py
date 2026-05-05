@@ -125,10 +125,16 @@ from providers.streaming import (
     Usage,
 )
 from settings_manager import SecretKey, SettingsManager
+from providers._dbg import dbg
 
 # Anthropic requires this beta header to accept content blocks that
 # reference uploaded file_ids (image, document, container_upload).
 ANTHROPIC_FILES_BETA = "files-api-2025-04-14"
+
+# Beta header for the extended (1-hour) prompt cache TTL. Required when
+# any cache_control block uses ttl="1h". Without this header, the SDK
+# falls back to the default 5-minute cache.
+ANTHROPIC_EXTENDED_CACHE_BETA = "extended-cache-ttl-2025-04-11"
 
 # Beta header for the code execution tool. Required when any office-format
 # file is in the request, because office files are consumed via
@@ -249,6 +255,7 @@ class AnthropicClient(BaseProviderClient):
         request: ChatRequest,
         cancel_flag: threading.Event,
     ) -> Iterator[StreamEvent]:
+        dbg("CLIENT", f"anthropic.complete_stream START for {request.model.id}")
         """Stream a completion from Anthropic, yielding StreamEvent values.
 
         Errors are emitted as StreamFailed, not raised. Cancellation is
@@ -259,10 +266,12 @@ class AnthropicClient(BaseProviderClient):
         # Cancellation requested before we even started? Honor it
         # without ever opening a connection.
         if cancel_flag.is_set():
+            dbg("CLIENT", "anthropic: cancel_flag already set, yielding StreamCancelled")
             yield StreamCancelled()
             return
 
         if not self.is_configured():
+            dbg("CLIENT", "anthropic: not configured, yielding StreamFailed")
             yield StreamFailed(
                 NotConfiguredError(
                     "Anthropic API key not set. Go to Settings to add it."
@@ -292,6 +301,9 @@ class AnthropicClient(BaseProviderClient):
         beta_headers = [ANTHROPIC_FILES_BETA]
         if needs_code_exec:
             beta_headers.append(ANTHROPIC_CODE_EXEC_BETA)
+
+        if request.file_refs:
+            beta_headers.append(ANTHROPIC_EXTENDED_CACHE_BETA)
 
         # Build kwargs explicitly so we only send `system` when set,
         # and only declare the code_execution tool when actually needed.
@@ -331,7 +343,7 @@ class AnthropicClient(BaseProviderClient):
             except BaseException:
                 cm.__exit__(None, None, None)
                 raise
-
+        dbg("CLIENT", "anthropic: calling with_rate_limit_retry to open stream")
         try:
             cm, stream = with_rate_limit_retry(
                 fn=_open_anthropic_stream,
@@ -340,6 +352,7 @@ class AnthropicClient(BaseProviderClient):
                 provider_label="Anthropic",
             )
         except AnthropicAuthError as exc:
+            dbg("CLIENT", f"anthropic: AuthError caught: {exc}")
             yield StreamFailed(
                 AuthenticationError(
                     "Anthropic rejected the API key. "
@@ -349,6 +362,7 @@ class AnthropicClient(BaseProviderClient):
             )
             return
         except AnthropicRateLimitError as exc:
+            dbg("CLIENT", f"anthropic: RateLimitError caught (after retries): {exc}")
             # Retry helper exhausted all retries — surface as RateLimitError.
             yield StreamFailed(
                 RateLimitError(
@@ -358,6 +372,7 @@ class AnthropicClient(BaseProviderClient):
             )
             return
         except APIConnectionError as exc:
+            dbg("CLIENT", f"anthropic: ConnectionError caught: {exc}")
             yield StreamFailed(
                 ProviderError(
                     "Could not reach Anthropic — check your internet connection.",
@@ -366,6 +381,7 @@ class AnthropicClient(BaseProviderClient):
             )
             return
         except APIError as exc:
+            dbg("CLIENT", f"anthropic: APIError caught: {exc}")
             message = getattr(exc, "message", str(exc))
             yield StreamFailed(
                 ProviderError(
@@ -375,6 +391,7 @@ class AnthropicClient(BaseProviderClient):
             )
             return
         except Exception as exc:
+            dbg("CLIENT", f"anthropic: UNEXPECTED exception caught: {type(exc).__name__}: {exc}")
             yield StreamFailed(
                 ProviderError(
                     f"Unexpected error opening Anthropic stream: {exc}",
@@ -399,6 +416,7 @@ class AnthropicClient(BaseProviderClient):
                 # yield StreamCancelled, and return. The finally block
                 # below also calls cm.__exit__ for full cleanup.
                 if cancel_flag.is_set():
+                    dbg("CLIENT", "anthropic: cancel observed mid-stream")
                     try:
                         stream.close()
                     except Exception:
@@ -417,6 +435,7 @@ class AnthropicClient(BaseProviderClient):
                 # SDK accumulates everything we need into the final
                 # message, which we read after iteration.
                 if isinstance(event, RawMessageStartEvent):
+                    dbg("CLIENT", "anthropic: yielding StreamStarted")
                     # First event of every stream. Carries the model
                     # name on event.message (verified via Probe 2).
                     # Emit StreamStarted exactly once.
@@ -445,6 +464,7 @@ class AnthropicClient(BaseProviderClient):
                     if delta is not None:
                         text = getattr(delta, "text", None)
                         if text:
+                            dbg("CLIENT", f"anthropic: yielding TextDelta len={len(text)}")
                             yield TextDelta(text=text)
 
         except AnthropicRateLimitError as exc:
@@ -524,6 +544,13 @@ class AnthropicClient(BaseProviderClient):
         usage = final_message.usage
         input_tokens = usage.input_tokens if usage else 0
         output_tokens = usage.output_tokens if usage else 0
+        # Cache stats for diagnostic visibility. cache_creation_input_tokens
+        # is what we paid the 25% surcharge to write; cache_read_input_tokens
+        # is what we got at 10% on this call. Together they tell us whether
+        # the cache is actually being hit on repeat calls.
+        cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        dbg("CLIENT", f"anthropic usage: input={input_tokens} output={output_tokens} cache_write={cache_creation} cache_read={cache_read}")
         cost = calculate_cost_usd(request.model, input_tokens, output_tokens)
 
         # Emit the Usage event before StreamCompleted. The UI updates
@@ -531,6 +558,7 @@ class AnthropicClient(BaseProviderClient):
         # into StreamCompleted, but separate events keep the protocol
         # clean and let providers that emit usage mid-stream — none do
         # today, but in v0.2.x some might — fit naturally.
+        dbg("CLIENT", f"anthropic: yielding Usage(in={input_tokens}, out={output_tokens})")
         yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
 
         latency = time.monotonic() - start
@@ -543,6 +571,7 @@ class AnthropicClient(BaseProviderClient):
             cost_usd=cost,
             served_model=final_message.model or request.model.api_model_name,
         )
+        dbg("CLIENT", "anthropic: yielding StreamCompleted, complete_stream END")
         yield StreamCompleted(final_response=final_response)
 
     # ---------- Internal helpers ----------
@@ -581,6 +610,19 @@ class AnthropicClient(BaseProviderClient):
         layer would have marked the (anthropic, mime) combination as
         UNSUPPORTED — but defensive handling means a misrouted file
         causes a degraded response, not a 400 error.
+
+        Prompt caching (v0.2.0):
+        The LAST file-related block in the message gets a cache_control
+        marker with ttl="1h". Anthropic's caching uses prefix matching:
+        marking the last block of the cacheable prefix tells Anthropic
+        "everything up to and including this point is the cacheable
+        prefix." The user's prompt text after this is NOT cached
+        (changes per query). On the first call within a session, the
+        cached portion bills at 125% of normal (the write surcharge);
+        on subsequent calls within 1 hour with identical file content,
+        the cached portion bills at 10% of normal. Massive reduction
+        in input-token consumption when a user asks multiple questions
+        about the same file(s) in a session.
         """
         anthropic_refs = [r for r in request.file_refs if r.provider == "anthropic"]
 
@@ -625,7 +667,16 @@ class AnthropicClient(BaseProviderClient):
                     "file_id": ref.remote_id,
                 })
 
-        # 4. The user's actual prompt comes last.
+        # 4. Mark the LAST file-related block with cache_control. Anthropic
+        # caches the prefix up to and including this marker. We add the
+        # marker only if at least one file block was added (text-only
+        # prompts have nothing worth caching). The user's prompt text
+        # added in step 5 is OUTSIDE the cached prefix.
+        if blocks:
+            blocks[-1]["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+
+        # 5. The user's actual prompt comes last — NOT cached, since it
+        # changes per query.
         blocks.append({"type": "text", "text": request.prompt})
         return blocks
 

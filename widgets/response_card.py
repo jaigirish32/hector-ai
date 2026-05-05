@@ -2,24 +2,49 @@
 A response card — shows one LLM's output with metrics and actions.
 
 State machine:
-    EMPTY    -> no request yet, card shows a dim placeholder
-    LOADING  -> request in flight, card shows a spinner line
-    COMPLETE -> response received, card shows content + metrics
-    ERROR    -> request failed, card shows the error message
+    EMPTY     -> no request yet, card shows a dim placeholder
+    LOADING   -> request is queued or in flight, no events yet, spinner-y badge
+    STREAMING -> events are arriving from the provider, body fills in live
+    COMPLETE  -> stream finished cleanly, body shows full answer + metrics
+    ERROR     -> stream errored out, card shows the error message
+    CANCELLED -> user clicked Stop mid-stream; partial text preserved,
+                 badge shows STOPPED. Not an error.
 
 A copy-to-clipboard button in the header copies the response body.
 The button is enabled only in the COMPLETE state and shows a brief
-checkmark confirmation when clicked.
+checkmark confirmation when clicked. (Streaming and cancelled states
+leave the copy button disabled — partial text is incomplete; copying
+it would be confusing. The user can still select-and-Ctrl-C from the
+text widget directly if they really want to.)
 
 Caveats: when set_response is called with caveats (e.g. "this provider
 only saw 1 of 2 attached files"), they appear in italic grey text
 between the answer body and the metrics footer. Hidden when no caveats
 are present and in non-COMPLETE states.
+
+v0.2.0 streaming
+----------------
+The card supports live text streaming via four new methods that the
+ComparisonView calls in response to dispatcher streaming signals:
+
+    start_streaming(model_name)         — STREAMING state, body cleared
+    append_stream_text(chunk)           — append a text chunk live
+    update_stream_usage(input, output)  — update token metric mid-stream
+    set_cancelled()                     — CANCELLED state, body preserved
+
+The existing set_response / set_error / set_loading / reset / set_badge
+methods are unchanged in shape and behaviour. Streaming is additive:
+during a normal Run the sequence is set_loading -> start_streaming ->
+many append_stream_text -> update_stream_usage -> set_response (which
+writes the authoritative final text from ChatResponse, replacing the
+streamed buffer). The "snap" from streamed text to authoritative text
+at completion should be invisible in practice — the SDK assembles the
+final text from the same deltas we received.
 """
 from enum import Enum
 
 from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtGui import QGuiApplication, QIcon, QPixmap, QTextCursor
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QFrame,
@@ -31,6 +56,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+import markdown
 
 from models import ModelInfo, Provider
 
@@ -66,12 +93,23 @@ def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
 
 
 class CardState(str, Enum):
-    """Which phase of the request/response cycle the card is in."""
+    """Which phase of the request/response cycle the card is in.
+
+    Six states, ordered by typical lifecycle:
+        EMPTY     - card just created, no request yet
+        LOADING   - request dispatched, waiting for first event
+        STREAMING - events arriving, body filling in live (v0.2.0)
+        COMPLETE  - terminal happy path
+        ERROR     - terminal error path
+        CANCELLED - terminal cancelled path (user clicked Stop) (v0.2.0)
+    """
 
     EMPTY = "empty"
     LOADING = "loading"
+    STREAMING = "streaming"
     COMPLETE = "complete"
     ERROR = "error"
+    CANCELLED = "cancelled"
 
 
 # Provider accent colors — used for the initial letter badge.
@@ -83,6 +121,158 @@ PROVIDER_COLORS = {
     Provider.XAI:          ("#1A1A1A", "#EDEDED"),
     Provider.LOCAL:        ("#1A1A1A", "#8A8A8A"),
 }
+
+
+import markdown
+
+
+# ---------- CSS for rendered response body ----------
+#
+# Applied to the QTextEdit body in both streaming and completion states.
+# QTextEdit supports a subset of CSS — enough for typography, colors,
+# tables, code blocks, and basic spacing. Background color matches
+# BG_CARD so the body blends with the card; teal accent matches the
+# GOLD brand color.
+#
+# QTextEdit does NOT support: flexbox, transitions, hover states,
+# box-shadow, or advanced selectors. For pixel-perfect claude.ai-style
+# rendering we would need QWebEngineView (Chromium) — not worth the
+# Mac packaging complexity for v0.2.0.
+
+_RESPONSE_CSS = """
+body {
+    font-family: 'Segoe UI', 'SF Pro Display', 'Inter', 'Helvetica Neue', sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #EDEDED;
+    background-color: #161616;
+    padding: 16px 20px;
+    margin: 0;
+}
+h1 {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #EDEDED;
+    margin: 18px 0 6px 0;
+    padding: 0;
+}
+h2 {
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #EDEDED;
+    margin: 14px 0 4px 0;
+    padding: 0;
+}
+h3 {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #EDEDED;
+    margin: 14px 0 6px 0;
+}
+h4, h5, h6 {
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.3;
+    color: #EDEDED;
+    margin: 12px 0 4px 0;
+}
+p {
+    margin: 0 0 12px 0;
+    color: #EDEDED;
+}
+ul, ol {
+    margin: 4px 0 12px 0;
+    padding-left: 20px;
+}
+li {
+    margin-bottom: 4px;
+    color: #EDEDED;
+}
+strong, b {
+    color: #EDEDED;
+    font-weight: 600;
+}
+em, i {
+    color: #EDEDED;
+    font-style: italic;
+}
+a {
+    color: #00D4C4;
+    text-decoration: none;
+}
+hr {
+    border: 0;
+    border-top: 1px solid #242424;
+    margin: 16px 0;
+    background-color: transparent;
+}
+table {
+    border-collapse: collapse;
+    margin: 12px 0;
+    background-color: #1A1A1A;
+}
+th {
+    background-color: #1D1D1D;
+    color: #EDEDED;
+    font-weight: 600;
+    padding: 8px 14px;
+    border: 1px solid #242424;
+    text-align: left;
+}
+td {
+    color: #EDEDED;
+    padding: 8px 14px;
+    border: 1px solid #242424;
+}
+code {
+    font-family: 'Cascadia Code', 'SF Mono', 'Consolas', 'Menlo', monospace;
+    font-size: 12px;
+    background-color: #1A1A1A;
+    color: #00D4C4;
+    padding: 2px 6px;
+    border-radius: 3px;
+}
+pre {
+    font-family: 'Cascadia Code', 'SF Mono', 'Consolas', 'Menlo', monospace;
+    font-size: 12px;
+    background-color: #1A1A1A;
+    color: #EDEDED;
+    padding: 12px 14px;
+    border: 1px solid #242424;
+    border-radius: 6px;
+    margin: 12px 0;
+    white-space: pre-wrap;
+}
+pre code {
+    background-color: transparent;
+    color: #EDEDED;
+    padding: 0;
+    border-radius: 0;
+}
+blockquote {
+    border-left: 3px solid #00D4C4;
+    padding-left: 12px;
+    margin: 12px 0;
+    color: #9A9A9A;
+}
+"""
+
+
+def _wrap_with_css(body_content: str) -> str:
+    """Wrap an HTML/text body in a full styled HTML document.
+
+    Used by both streaming (plain text inside styled body) and
+    completion (markdown-rendered HTML inside styled body) paths.
+    QTextEdit's setHtml accepts a full document or a fragment; we
+    use a full document so the <style> block is recognized and
+    applied. The body content is inserted as-is — for streaming
+    paths it's plain text; for completion paths it's rendered
+    markdown HTML.
+    """
+    return f"<html><head><style>{_RESPONSE_CSS}</style></head><body>{body_content}</body></html>"
 
 
 class ResponseCard(QFrame):
@@ -100,7 +290,7 @@ class ResponseCard(QFrame):
 
         self.setObjectName("card")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setMaximumHeight(420)
+        
 
         
         root = QVBoxLayout(self)
@@ -116,7 +306,6 @@ class ResponseCard(QFrame):
         self._body.setObjectName("responseBody")
         self._body.setReadOnly(True)
         self._body.setMinimumHeight(140)
-        self._body.setMaximumHeight(280)
         self._body.setPlaceholderText("Waiting for prompt...")
         root.addWidget(self._body, stretch=1)
 
@@ -247,7 +436,14 @@ class ResponseCard(QFrame):
     # ---------- Public API — called from the Compare view ----------
 
     def set_loading(self) -> None:
-        """Mark the card as waiting on a response."""
+        """Mark the card as waiting on a response.
+
+        Called from ComparisonView right after the Run button is
+        clicked, before any provider events have arrived. The brief
+        moment between dispatch and the first stream_started event
+        lives here. As soon as start_streaming() is called, the card
+        leaves LOADING for STREAMING.
+        """
         self._state = CardState.LOADING
         self._body.setPlaceholderText("Generating response...")
         self._body.clear()
@@ -255,6 +451,77 @@ class ResponseCard(QFrame):
         self._set_caveats(())
         self._set_status("GENERATING", accent=False)
         self._apply_state()
+
+    def start_streaming(self, model_name: str) -> None:
+        """..."""
+        self._state = CardState.STREAMING
+        # Establish the styled empty body. Subsequent append_stream_text
+        # calls insert plain text inside this styled document, so the
+        # streaming text picks up the body's font, color, and line-height
+        # from the CSS. Markdown characters (|, #, **) appear literally
+        # during streaming — they'll be rendered properly when set_response
+        # finalizes the card with markdown→HTML conversion.
+        self._body.setHtml(_wrap_with_css(""))
+        self._body.setPlaceholderText("")
+        self._update_metrics("—", "—", "—")
+        self._set_caveats(())
+        self._set_status("STREAMING", accent=False)
+        self._apply_state()
+
+    def append_stream_text(self, chunk: str) -> None:
+        """Append a streamed text chunk to the body.
+
+        Called once per dispatcher stream_text_delta signal. Uses
+        QTextCursor positioned at the end of the document so we
+        insert without re-rendering the whole text — efficient even
+        for hundreds of chunks per second. After insertion, scrolls
+        the view to the bottom so the latest text is always visible.
+
+        No-op if the card is not in STREAMING state. This guards
+        against late deltas arriving after the card has already
+        transitioned to COMPLETE / ERROR / CANCELLED — the dispatcher
+        layer should not deliver these in correct operation, but a
+        defensive check keeps the UI stable if it ever does.
+        """
+        if self._state != CardState.STREAMING:
+            return
+        if not chunk:
+            return
+
+        # Insert at the end of the document. Using a cursor positioned
+        # at End is the canonical Qt pattern for streaming append; it
+        # avoids re-flowing the entire document the way setPlainText
+        # would, and preserves any selection the user has elsewhere
+        # in the text.
+        cursor = self._body.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._body.setTextCursor(cursor)
+        self._body.insertPlainText(chunk)
+
+        # Always auto-scroll to the bottom for v0.2.0. A future polish
+        # step will detect "user has scrolled up to read" and skip the
+        # auto-scroll in that case (claude.ai-style behaviour). For
+        # now: simple, predictable, latest text always visible.
+        scroll_bar = self._body.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def update_stream_usage(self, input_tokens: int, output_tokens: int) -> None:
+        """Update the token metric mid-stream.
+
+        Called once per dispatcher stream_usage signal. Most providers
+        emit usage near or at the end of a stream, so this typically
+        fires shortly before set_response is called. The token counter
+        flips from "—" to the real numbers a moment before completion.
+
+        No-op if the card is not in STREAMING state. As with
+        append_stream_text, this is defensive — late events shouldn't
+        arrive but if they do, ignore them rather than corrupt a
+        completed/cancelled card's display.
+        """
+        if self._state != CardState.STREAMING:
+            return
+        total = input_tokens + output_tokens
+        self._tokens_metric.value_label.setText(f"{total}")
 
     def set_response(
         self,
@@ -264,13 +531,23 @@ class ResponseCard(QFrame):
         cost_usd: float,
         caveats: tuple[str, ...] = (),
     ) -> None:
-        """Populate the card with a successful response.
-
-        caveats appear under the answer in italic grey text. Pass an
-        empty tuple (default) to omit. Each caveat becomes its own line.
-        """
+        
         self._state = CardState.COMPLETE
-        self._body.setPlainText(text)
+
+        # Render markdown to HTML so tables, headers, lists, and code
+        # blocks display properly. The 'tables' extension handles
+        # markdown table syntax; 'fenced_code' handles ```code blocks```;
+        # 'nl2br' converts single newlines to <br> so the rendered
+        # output matches claude.ai's line-break behavior. We use
+        # setHtml() instead of setPlainText() — QTextEdit's rich-text
+        # mode handles the HTML and the clipboard automatically gets
+        # both HTML and plain-text formats.
+        html = markdown.markdown(
+            text,
+            extensions=["tables", "fenced_code", "nl2br"],
+        )
+        self._body.setHtml(_wrap_with_css(html))
+
         self._update_metrics(
             f"{latency_seconds:.1f} s",
             f"{tokens}",
@@ -281,12 +558,35 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_error(self, message: str) -> None:
-        """Show an error state on the card."""
+        """..."""
         self._state = CardState.ERROR
-        self._body.setPlainText(f"Error: {message}")
+        # Use styled body so error text picks up the same typography
+        # as success responses. Wrapping in a <p> tag makes the error
+        # message a proper paragraph rather than raw text appended to
+        # the body root.
+        error_html = f"<p>Error: {message}</p>"
+        self._body.setHtml(_wrap_with_css(error_html))
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
         self._set_status("FAILED", accent=False)
+        self._apply_state()
+
+    def set_cancelled(self) -> None:
+        """Mark the card as cancelled by the user (Stop pressed mid-stream).
+
+        Called from ComparisonView when the dispatcher's stream_cancelled
+        signal fires. UNLIKE set_error, this preserves whatever partial
+        text was already streamed into the body — the user explicitly
+        chose to stop and presumably wants to see what they got. The
+        STOPPED badge in the header signals the cancellation. Metrics
+        stay as-is (token count from update_stream_usage if it arrived,
+        otherwise dashes; latency and cost stay dashes since the stream
+        didn't complete).
+        """
+        self._state = CardState.CANCELLED
+        # Body text is preserved as-is — whatever streamed in before
+        # the user clicked Stop. No call to setPlainText or clear().
+        self._set_status("STOPPED", accent=False)
         self._apply_state()
 
     def set_badge(self, text: str, accent: bool = True) -> None:
@@ -341,21 +641,26 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Enable/disable copy button based on whether a response exists."""
+        """Enable/disable copy button based on whether a response exists.
+
+        Copy is enabled ONLY in COMPLETE state. STREAMING and CANCELLED
+        leave it disabled because the buffer is incomplete (streaming)
+        or partial (cancelled) — copying it would set the user up for
+        confusion. Power users can still select+Ctrl-C from the text
+        widget directly if they want partial text.
+        """
         is_complete = self._state == CardState.COMPLETE
         self._copy_button.setEnabled(is_complete)
 
     def _on_copy(self) -> None:
-        """Copy the response body to the system clipboard.
-
-        Shows a brief checkmark confirmation on the button by swapping
-        to the check SVG icon, then schedules a revert after 1500ms
-        via QTimer.singleShot.
-        """
-        text = self._body.toPlainText()
-        if not text:
+        
+        if not self._body.toPlainText():
             return
-        QGuiApplication.clipboard().setText(text)
+        self._body.selectAll()
+        self._body.copy()
+        cursor = self._body.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._body.setTextCursor(cursor)
         self._copy_button.setIcon(self._copy_icon_done)
         QTimer.singleShot(1500, self._revert_copy_icon)
 
