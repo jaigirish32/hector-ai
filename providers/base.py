@@ -6,13 +6,25 @@ contract. The dispatcher treats all clients uniformly — it only
 cares about the BaseProviderClient interface, not which service
 the request is going to.
 """
-from __future__ import annotations
+from __future__ import annotations  # NEW: enables string annotations for StreamEvent forward reference
 
+import threading                              # NEW: for cancel_flag type in complete_stream()
 from abc import ABC, abstractmethod
+from collections.abc import Iterator          # NEW: for Iterator[StreamEvent] return type
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING              # NEW: lets us import StreamEvent for type-checking only
 
 from models import ModelInfo
+
+# NEW: type-only import to avoid circular dependency at runtime.
+# streaming.py imports ChatResponse and ProviderError from this file,
+# so base.py cannot import from streaming.py at runtime. The
+# TYPE_CHECKING block runs only under type-checkers (mypy, pyright);
+# at runtime the import is skipped, and any annotations referencing
+# StreamEvent are evaluated as strings (thanks to __future__ annotations).
+if TYPE_CHECKING:
+    from providers.streaming import StreamEvent
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +127,20 @@ class NotConfiguredError(ProviderError):
 # Provider client contract
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Provider client contract
+# ---------------------------------------------------------------------------
+
 class BaseProviderClient(ABC):
     """The contract every provider client must fulfill."""
 
-    @abstractmethod
+    # CHANGED in v0.2.0 streaming migration: was @abstractmethod. Now
+    # non-abstract with a NotImplementedError default — same transitional
+    # pattern as complete_stream() got in Step 2. Concrete provider clients
+    # remove their override of this method as they are migrated to
+    # streaming, one at a time. Once all four providers are migrated and
+    # the dispatcher consumes only streams, this method is removed from
+    # BaseProviderClient entirely.
     def complete(self, request: ChatRequest) -> ChatResponse:
         """Send the request and return the response.
 
@@ -126,13 +148,86 @@ class BaseProviderClient(ABC):
         dispatcher layer, not here.
 
         Raises one of the ProviderError subclasses on failure.
+
+        NOTE (v0.2.0 transition): this method is being phased out in
+        favour of complete_stream(). The dispatcher no longer calls it.
+        Concrete provider clients are removing their override of this
+        method as they migrate to streaming. Until removal of this
+        method on the base class, calling it on a migrated provider
+        falls through to this default, which raises NotImplementedError.
         """
-        ...
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.complete() has been removed as "
+            f"part of the v0.2.0 streaming migration. "
+            f"Use complete_stream() instead."
+        )
 
     @abstractmethod
     def is_configured(self) -> bool:
         """Return True if this client has what it needs to call the API."""
         ...
+
+    # NEW: streaming contract.
+    #
+    # complete_stream() is the v0.2.0 replacement for complete(). It
+    # yields a sequence of StreamEvent values as the response is
+    # generated, instead of returning a single ChatResponse at the end.
+    # The provider client assembles a ChatResponse internally as the
+    # stream progresses and emits it inside StreamCompleted at the end —
+    # so the durable record (used by the response card and by future
+    # multi-turn history) is preserved alongside the live streaming.
+    #
+    # Errors during streaming are reported as StreamFailed events, NOT
+    # as raised exceptions. This is a deliberate change from complete():
+    # exceptions raised from a generator that is being iterated across a
+    # thread boundary (worker thread → main thread via Qt signals in the
+    # dispatcher) are fragile and easily swallowed. Yielding StreamFailed
+    # makes failure part of the protocol, handled uniformly with every
+    # other event by consumers.
+    #
+    # cancel_flag is a threading.Event the caller (the dispatcher worker)
+    # sets when the user clicks Stop. The implementation MUST check the
+    # flag between events and yield StreamCancelled then return when it
+    # is set. The flag has no default value: every caller must construct
+    # one explicitly. This forces cancellation to be a first-class
+    # concern in every code path that calls complete_stream().
+    #
+    # During the v0.2.0 migration, this method has a default body that
+    # raises NotImplementedError. Each provider's concrete implementation
+    # is added one at a time (Anthropic first, then OpenAI, Azure,
+    # Gemini). Until a given provider is migrated, calling this method
+    # on it raises — the dispatcher surfaces a graceful error to the UI
+    # ("This provider is not yet migrated to streaming"). Once all four
+    # providers implement complete_stream(), this default is removed and
+    # the method is marked @abstractmethod.
+    def complete_stream(
+        self,
+        request: ChatRequest,
+        cancel_flag: threading.Event,
+    ) -> Iterator["StreamEvent"]:
+        """Send the request and yield streaming events as the response generates.
+
+        Yields a sequence of StreamEvent values:
+          StreamStarted   — once at the start
+          TextDelta       — many, as text is generated
+          Usage           — once, when the provider reports token counts
+          StreamCompleted — once at the end (carries the final ChatResponse)
+          StreamFailed    — once if the stream errors out (terminates the stream)
+          StreamCancelled — once if cancel_flag was observed (terminates the stream)
+
+        After StreamCompleted, StreamFailed, or StreamCancelled, the
+        stream is over and no further events are yielded.
+
+        Implementations MUST check `cancel_flag.is_set()` periodically
+        (between SDK chunks) and yield StreamCancelled then return when
+        the flag is set, closing the underlying SDK stream cleanly so
+        the connection is released and no further tokens are billed.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} has not been migrated to streaming yet. "
+            f"Until its complete_stream() is implemented, this provider cannot "
+            f"be used in streaming mode. (v0.2.0 migration in progress.)"
+        )
 
 
 # ---------------------------------------------------------------------------

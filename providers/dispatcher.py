@@ -17,9 +17,32 @@ Native-only routing (Phase 2e), permissive policy:
         Lets a PDF-supporting provider answer about the PDF even when
         an attached xlsx isn't supported.
       - All refs → dispatch normally, no caveat.
+
+v0.2.0 streaming
+----------------
+Each worker now consumes the provider's complete_stream() event
+iterator instead of calling complete(). Streaming events
+(StreamStarted, TextDelta, Usage) are re-emitted as Qt signals during
+the stream, so the UI can update live. The terminal events
+(StreamCompleted, StreamFailed, StreamCancelled) drive the existing
+_pending_count countdown — exactly one terminal per worker, same as
+before, just with a third option (cancellation) added.
+
+Cancellation: each worker is given its own threading.Event before it
+starts. The dispatcher exposes cancel(model_id) which sets that
+worker's flag. The provider client's complete_stream() implementation
+is required to check the flag between events and yield StreamCancelled
+when set, then close its underlying SDK stream cleanly.
+
+During the migration: providers that have not yet implemented
+complete_stream() inherit the default body from BaseProviderClient
+which raises NotImplementedError. The worker catches this and emits a
+clean failure to the UI. So an un-migrated provider shows "not yet
+migrated to streaming" in its card while migrated ones stream live.
 """
 from __future__ import annotations
 
+import threading                                                          # NEW: per-worker cancel flags
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
@@ -38,6 +61,15 @@ from providers.base import (
 )
 from providers.gemini_client import GeminiClient
 from providers.openai_client import OpenAIClient
+# NEW: streaming event types for the worker's match dispatch
+from providers.streaming import (
+    StreamCancelled,
+    StreamCompleted,
+    StreamFailed,
+    StreamStarted,
+    TextDelta,
+    Usage,
+)
 from settings_manager import SettingsManager
 
 
@@ -50,60 +82,144 @@ _PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
 
 
 class _WorkerSignals(QObject):
-    succeeded = Signal(str, ChatResponse)
-    failed = Signal(str, str)
-    finished = Signal(str)
+    # Existing terminal signals — unchanged. Each worker emits exactly ONE
+    # of (succeeded, failed, stream_cancelled) before exiting; that one
+    # drives the dispatcher's _pending_count countdown. `finished` always
+    # follows in the worker's finally block, but does not itself decrement
+    # the counter — it exists for any future cleanup that should happen
+    # regardless of how the worker exited.
+    succeeded = Signal(str, ChatResponse)            # (model_id, response) — terminal happy path
+    failed = Signal(str, str)                        # (model_id, friendly_message) — terminal error
+    finished = Signal(str)                           # (model_id) — always fired
+
+    # NEW streaming signals — fired DURING the stream, before the terminal.
+    # These never decrement _pending_count; they only drive live UI updates.
+    stream_started = Signal(str, str)                # (model_id, served_model_name)
+    stream_text_delta = Signal(str, str)             # (model_id, text_chunk)
+    stream_usage = Signal(str, int, int)             # (model_id, input_tokens, output_tokens)
+
+    # NEW terminal signal — user-cancelled stream. Mirrors succeeded/failed
+    # in shape (one per worker, drives countdown via _on_worker_cancelled).
+    stream_cancelled = Signal(str)                   # (model_id)
 
 
 class _ProviderWorker(QRunnable):
     """Runs one provider call. Optional pre_caveats are merged into the
     response's own caveats on success — used by the dispatcher to surface
     routing-layer notes (e.g. partial file coverage) alongside any caveats
-    the provider client itself may have produced."""
+    the provider client itself may have produced.
+
+    v0.2.0: consumes complete_stream() event iterator and re-emits each
+    event as a Qt signal. Holds a per-worker threading.Event used by the
+    dispatcher to request cancellation; the provider's complete_stream()
+    is responsible for observing the flag and yielding StreamCancelled.
+    """
 
     def __init__(
         self,
         client: BaseProviderClient,
         request: ChatRequest,
         signals: _WorkerSignals,
+        cancel_flag: threading.Event,           # NEW: per-worker cancel flag
         pre_caveats: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self._client = client
         self._request = request
         self._signals = signals
+        self._cancel_flag = cancel_flag         # NEW
         self._pre_caveats = pre_caveats
 
     def run(self) -> None:
         model_id = self._request.model.id
         try:
-            response = self._client.complete(self._request)
-            if self._pre_caveats:
-                # Prepend dispatcher-level caveats so they appear first;
-                # any caveats the provider client added stay after them.
-                merged = tuple(self._pre_caveats) + tuple(response.caveats)
-                response = ChatResponse(
-                    text=response.text,
-                    latency_seconds=response.latency_seconds,
-                    input_tokens=response.input_tokens,
-                    output_tokens=response.output_tokens,
-                    cost_usd=response.cost_usd,
-                    served_model=response.served_model,
-                    caveats=merged,
-                )
-            self._signals.succeeded.emit(model_id, response)
+            # Iterate the provider's stream. Each event is matched to the
+            # appropriate Qt signal. Terminal events (StreamCompleted,
+            # StreamFailed, StreamCancelled) emit their signal then return
+            # immediately, ensuring exactly one terminal is emitted even
+            # if (against contract) the provider yields more events after.
+            for event in self._client.complete_stream(self._request, self._cancel_flag):
+                if isinstance(event, StreamStarted):
+                    self._signals.stream_started.emit(model_id, event.model)
+
+                elif isinstance(event, TextDelta):
+                    self._signals.stream_text_delta.emit(model_id, event.text)
+
+                elif isinstance(event, Usage):
+                    self._signals.stream_usage.emit(
+                        model_id, event.input_tokens, event.output_tokens
+                    )
+
+                elif isinstance(event, StreamCompleted):
+                    # Apply dispatcher-level pre_caveats to the final
+                    # ChatResponse, exactly as the legacy non-streaming
+                    # path did. The provider client doesn't know about
+                    # pre_caveats; merging happens at the dispatcher
+                    # layer so provider clients stay focused on the API.
+                    final = event.final_response
+                    if self._pre_caveats:
+                        final = ChatResponse(
+                            text=final.text,
+                            latency_seconds=final.latency_seconds,
+                            input_tokens=final.input_tokens,
+                            output_tokens=final.output_tokens,
+                            cost_usd=final.cost_usd,
+                            served_model=final.served_model,
+                            caveats=tuple(self._pre_caveats) + tuple(final.caveats),
+                        )
+                    self._signals.succeeded.emit(model_id, final)
+                    return  # terminal — stop processing
+
+                elif isinstance(event, StreamFailed):
+                    self._signals.failed.emit(model_id, str(event.error))
+                    return  # terminal
+
+                elif isinstance(event, StreamCancelled):
+                    self._signals.stream_cancelled.emit(model_id)
+                    return  # terminal
+
+                # Unknown event type: ignore, keep iterating. Future event
+                # types (e.g. v0.3.0 tool events) added here as needed.
+
+        except NotImplementedError as exc:
+            # Provider hasn't been migrated to streaming yet. Per Step 2's
+            # design, BaseProviderClient.complete_stream() raises this on
+            # un-migrated providers. Surface a clean message to the UI
+            # rather than letting the exception escape the worker.
+            self._signals.failed.emit(
+                model_id,
+                "This provider is not yet migrated to streaming. Coming soon.",
+            )
         except ProviderError as exc:
+            # Defensive: the streaming contract says errors should be
+            # StreamFailed events. If a provider client violates the
+            # contract and raises instead, treat it as a normal failure.
             self._signals.failed.emit(model_id, str(exc))
         except Exception as exc:
+            # Defensive: any other unexpected exception escaping the
+            # iterator. Don't let it kill the worker silently.
             self._signals.failed.emit(model_id, f"Unexpected error: {exc}")
         finally:
+            # Always fire finished. Currently used only as a generic
+            # "worker done" notification; _pending_count is decremented
+            # by the terminal-signal slots, not by this.
             self._signals.finished.emit(model_id)
 
 
 class Dispatcher(QObject):
+    # Existing public signals — unchanged. UI code already connected to
+    # these continues to work without any change.
     response_received = Signal(str, ChatResponse)
     response_failed = Signal(str, str)
     all_complete = Signal()
+
+    # NEW public streaming signals. UI code that wants live updates
+    # connects to these; existing code that only handles completion can
+    # stay on response_received / response_failed.
+    stream_started = Signal(str, str)                   # (model_id, served_model_name)
+    stream_text_delta = Signal(str, str)                # (model_id, text_chunk)
+    stream_usage = Signal(str, int, int)                # (model_id, input_tokens, output_tokens)
+    stream_cancelled = Signal(str)                      # (model_id) — terminal
 
     def __init__(
         self,
@@ -129,9 +245,42 @@ class Dispatcher(QObject):
         self._pool = QThreadPool.globalInstance()
         self._pending_count = 0
 
+        # NEW: per-Run map of model_id → cancel flag. Populated when each
+        # worker is created in dispatch(); cleared when the Run completes
+        # (in _decrement_pending). cancel(model_id) sets the matching flag.
+        self._cancel_flags: dict[str, threading.Event] = {}
+
         self._signals = _WorkerSignals()
         self._signals.succeeded.connect(self._on_worker_succeeded)
         self._signals.failed.connect(self._on_worker_failed)
+        # NEW: streaming-event signals re-emitted upward to the UI.
+        # Intermediate events pass straight through (no counter changes).
+        # The cancellation terminal goes through _on_worker_cancelled so
+        # it can both re-emit and decrement _pending_count, mirroring the
+        # pattern of _on_worker_succeeded / _on_worker_failed.
+        self._signals.stream_started.connect(self.stream_started.emit)
+        self._signals.stream_text_delta.connect(self.stream_text_delta.emit)
+        self._signals.stream_usage.connect(self.stream_usage.emit)
+        self._signals.stream_cancelled.connect(self._on_worker_cancelled)
+
+    # ---------- Public cancellation API ----------
+
+    def cancel(self, model_id: str) -> None:
+        """Tell the worker for the given model to stop streaming.
+
+        Sets that worker's threading.Event. The provider client's
+        complete_stream() implementation is required to check the flag
+        between events and yield StreamCancelled when set, then close
+        the underlying SDK stream cleanly. Idempotent — calling twice
+        on the same model is a no-op (Event.set() is idempotent).
+
+        Has no effect if no worker for this model is currently running
+        (e.g. cancel called after the stream already completed). The
+        UI should not rely on the worker being still alive.
+        """
+        flag = self._cancel_flags.get(model_id)
+        if flag is not None:
+            flag.set()
 
     # ---------- Modern dispatch: pre-resolved file refs ----------
 
@@ -234,8 +383,15 @@ class Dispatcher(QObject):
             return
 
         self._pending_count = len(runnable_jobs)
+        # Fresh per-Run cancel flags. Old ones (from the previous Run)
+        # were cleared in _decrement_pending when that Run finished.
+        self._cancel_flags = {}
         for model_id, request, client, pre_caveats in runnable_jobs:
-            worker = _ProviderWorker(client, request, self._signals, pre_caveats)
+            cancel_flag = threading.Event()                 # NEW: one Event per worker
+            self._cancel_flags[model_id] = cancel_flag      # NEW: track by model_id for cancel()
+            worker = _ProviderWorker(
+                client, request, self._signals, cancel_flag, pre_caveats
+            )
             self._pool.start(worker)
 
     # ---------- Legacy dispatch: file paths resolved at run time ----------
@@ -303,8 +459,14 @@ class Dispatcher(QObject):
             return
 
         self._pending_count = len(runnable_jobs)
+        # Fresh per-Run cancel flags (same pattern as dispatch_with_resolved_refs).
+        self._cancel_flags = {}
         for model_id, request, client in runnable_jobs:
-            worker = _ProviderWorker(client, request, self._signals)
+            cancel_flag = threading.Event()                 # NEW
+            self._cancel_flags[model_id] = cancel_flag      # NEW
+            worker = _ProviderWorker(
+                client, request, self._signals, cancel_flag
+            )
             self._pool.start(worker)
 
     # ---------- Worker callbacks ----------
@@ -317,10 +479,23 @@ class Dispatcher(QObject):
         self.response_failed.emit(model_id, message)
         self._decrement_pending()
 
+    # NEW: third terminal slot. Mirrors _on_worker_succeeded/_on_worker_failed —
+    # re-emits the public signal upward to the UI, then decrements the
+    # countdown. Without this, cancellations would leak _pending_count
+    # and the dispatcher would refuse all subsequent Runs.
+    def _on_worker_cancelled(self, model_id: str) -> None:
+        self.stream_cancelled.emit(model_id)
+        self._decrement_pending()
+
     def _decrement_pending(self) -> None:
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._pending_count = 0
+            # Run is fully done — drop all per-worker cancel flags.
+            # If we don't clear here, stale flags from this Run hang
+            # around in memory until the next Run replaces the dict.
+            # Cheap to clear, safer to clear.
+            self._cancel_flags.clear()                      # NEW
             self.all_complete.emit()
 
     @staticmethod

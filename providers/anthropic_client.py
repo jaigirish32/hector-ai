@@ -3,9 +3,10 @@ Anthropic (Claude) client — calls api.anthropic.com via the official
 `anthropic` Python SDK.
 
 Differences from our OpenAI client:
-- Endpoint method is `messages.create`, not `chat.completions.create`.
+- Endpoint method is `messages.create` (or `messages.stream` for streaming),
+  not `chat.completions.create`.
 - System prompt is a TOP-LEVEL parameter, not a message in the list.
-- Response content is a list of blocks; we read text from the first block.
+- Response content is a list of blocks; we read text from each block.
 - `max_tokens` is REQUIRED by Anthropic (not optional).
 - Token field names are `input_tokens` and `output_tokens` (not prompt/completion).
 
@@ -34,10 +35,55 @@ The shape of the content block is determined entirely by the MIME type of
 the FileRef at chat time. The registry stores the real MIME, so this
 client always sees the truth even when the upload was rewritten as
 anonymous bytes.
+
+v0.2.0 streaming migration
+--------------------------
+The non-streaming complete() method has been removed. complete_stream()
+yields StreamEvent values as the response is generated. The streaming
+flow:
+
+  StreamStarted     — emitted once after the SDK acknowledges the request
+  TextDelta x N     — emitted for each text chunk Anthropic sends
+  Usage             — emitted once at the end, with final token counts
+  StreamCompleted   — emitted once at the end, carrying the assembled
+                      ChatResponse (built via the SDK's get_final_message
+                      helper, parsed by the same logic that complete()
+                      used to use)
+  StreamFailed      — emitted if any error occurs (auth, connection,
+                      rate-limit-after-exhaustion, unexpected). After
+                      this, the stream is over.
+  StreamCancelled   — emitted if the worker's cancel_flag is observed
+                      between events. The SDK stream is closed cleanly
+                      so the connection releases and no further tokens
+                      are billed.
+
+SDK types used (verified against the installed anthropic SDK):
+  - client.messages.stream(...) returns a MessageStreamManager (context manager).
+  - Entering the context manager returns a MessageStream object.
+  - MessageStream.get_final_message() returns a ParsedMessage with .model,
+    .content (list of ParsedTextBlock and other block types), .usage.
+  - Iterating the stream yields RawMessageStartEvent, RawContentBlockStartEvent,
+    RawContentBlockDeltaEvent, RawContentBlockStopEvent, RawMessageDeltaEvent,
+    RawMessageStopEvent in order.
+  - We only react to two: RawMessageStartEvent (for StreamStarted) and
+    RawContentBlockDeltaEvent (for TextDelta when delta.text is present).
+
+Code execution intermediate steps (Claude writing/running code) do NOT
+emit dedicated stream events in v0.2.0 — they are silently consumed by
+the streaming loop, but appear correctly in the final ChatResponse via
+get_final_message. v0.3.0 will add ToolCallStarted / ToolCallResult
+events so the UI can show a live trace of code execution.
+
+Rate-limit retry covers ONLY stream opening — once events start flowing,
+we do not retry mid-stream (showing the user partial text and then
+restarting would be confusing). If the rate limit is exhausted past all
+retries, StreamFailed(RateLimitError) is yielded.
 """
 from __future__ import annotations
 
+import threading
 import time
+from collections.abc import Iterator
 
 from anthropic import (
     Anthropic,
@@ -45,6 +91,16 @@ from anthropic import (
     APIError,
     AuthenticationError as AnthropicAuthError,
     RateLimitError as AnthropicRateLimitError,
+)
+# Verified via Probe 2: these are the exact SDK event class names used
+# by the installed `anthropic` package. The SDK's own TextDelta type
+# (anthropic.types.TextDelta) shares a name with our streaming.TextDelta;
+# we deliberately do NOT import the SDK's TextDelta — we access
+# event.delta.text via attribute access, which works regardless of the
+# delta's concrete type.
+from anthropic.types import (
+    RawContentBlockDeltaEvent,
+    RawMessageStartEvent,
 )
 
 from providers.base import (
@@ -58,8 +114,17 @@ from providers.base import (
     RateLimitError,
     calculate_cost_usd,
 )
-from settings_manager import SecretKey, SettingsManager
 from providers._retry import with_rate_limit_retry
+from providers.streaming import (
+    StreamCancelled,
+    StreamCompleted,
+    StreamEvent,
+    StreamFailed,
+    StreamStarted,
+    TextDelta,
+    Usage,
+)
+from settings_manager import SecretKey, SettingsManager
 
 # Anthropic requires this beta header to accept content blocks that
 # reference uploaded file_ids (image, document, container_upload).
@@ -128,6 +193,7 @@ _MIME_TO_FRIENDLY: dict[str, tuple[str, str]] = {
         ("Legacy Microsoft PowerPoint presentation (.ppt)", "python-pptx"),
 }
 
+
 def _parse_anthropic_retry_after(exc: BaseException) -> int | None:
     """Read the retry-after header from an Anthropic SDK exception.
 
@@ -166,6 +232,7 @@ def _parse_anthropic_retry_after(exc: BaseException) -> int | None:
 
     return None
 
+
 class AnthropicClient(BaseProviderClient):
     """Client for api.anthropic.com (Claude models)."""
 
@@ -177,12 +244,37 @@ class AnthropicClient(BaseProviderClient):
     def is_configured(self) -> bool:
         return self._settings.has_secret(SecretKey.ANTHROPIC_API_KEY)
 
-    def complete(self, request: ChatRequest) -> ChatResponse:
-        if not self.is_configured():
-            raise NotConfiguredError(
-                "Anthropic API key not set. Go to Settings to add it."
-            )
+    def complete_stream(
+        self,
+        request: ChatRequest,
+        cancel_flag: threading.Event,
+    ) -> Iterator[StreamEvent]:
+        """Stream a completion from Anthropic, yielding StreamEvent values.
 
+        Errors are emitted as StreamFailed, not raised. Cancellation is
+        observed via cancel_flag between SDK events; on cancellation,
+        the SDK stream is closed cleanly and StreamCancelled is yielded.
+        """
+        # ---------- Pre-stream validation ----------
+        # Cancellation requested before we even started? Honor it
+        # without ever opening a connection.
+        if cancel_flag.is_set():
+            yield StreamCancelled()
+            return
+
+        if not self.is_configured():
+            yield StreamFailed(
+                NotConfiguredError(
+                    "Anthropic API key not set. Go to Settings to add it."
+                )
+            )
+            return
+
+        # ---------- Build the request ----------
+        # Logic identical to the legacy complete() did. Verified via
+        # Probe 3 that messages.stream() accepts the same kwargs as
+        # messages.create() (model, messages, max_tokens, temperature,
+        # system, tools, extra_headers).
         api_key = self._settings.get_secret(SecretKey.ANTHROPIC_API_KEY)
         client = Anthropic(api_key=api_key)
 
@@ -217,67 +309,241 @@ class AnthropicClient(BaseProviderClient):
         if needs_code_exec:
             create_kwargs["tools"] = [ANTHROPIC_CODE_EXEC_TOOL]
 
+        # ---------- Open the stream (with retry on RateLimitError) ----------
+        # The retry helper wraps the OPEN of the stream — it retries the
+        # initial HTTP request that establishes the streaming connection.
+        # Once the stream is open and events start flowing, no retry
+        # happens (we're not going to restart mid-stream and re-emit text).
+        #
+        # client.messages.stream() returns a MessageStreamManager (the
+        # context manager). The actual HTTP request fires in __enter__.
+        # If __enter__ raises after the cm is constructed, we still need
+        # to clean up the cm — handled by _open_anthropic_stream below.
         start = time.monotonic()
+
+        def _open_anthropic_stream() -> tuple:
+            """Open the stream; return (cm, stream). Cleans up cm on
+            failure so we don't leak a half-constructed context manager."""
+            cm = client.messages.stream(**create_kwargs)
+            try:
+                stream = cm.__enter__()
+                return cm, stream
+            except BaseException:
+                cm.__exit__(None, None, None)
+                raise
+
         try:
-            response = with_rate_limit_retry(
-                fn=lambda: client.messages.create(**create_kwargs),
+            cm, stream = with_rate_limit_retry(
+                fn=_open_anthropic_stream,
                 sdk_rate_limit_exception=AnthropicRateLimitError,
                 parse_retry_after_seconds=_parse_anthropic_retry_after,
                 provider_label="Anthropic",
             )
         except AnthropicAuthError as exc:
-            raise AuthenticationError(
-                "Anthropic rejected the API key. "
-                "Check it at console.anthropic.com and confirm you have credit.",
-                raw=str(exc),
-            ) from exc
+            yield StreamFailed(
+                AuthenticationError(
+                    "Anthropic rejected the API key. "
+                    "Check it at console.anthropic.com and confirm you have credit.",
+                    raw=str(exc),
+                )
+            )
+            return
+        except AnthropicRateLimitError as exc:
+            # Retry helper exhausted all retries — surface as RateLimitError.
+            yield StreamFailed(
+                RateLimitError(
+                    "Anthropic rate limited after 3 retries.",
+                    raw=str(exc),
+                )
+            )
+            return
         except APIConnectionError as exc:
-            raise ProviderError(
-                "Could not reach Anthropic — check your internet connection.",
-                raw=str(exc),
-            ) from exc
+            yield StreamFailed(
+                ProviderError(
+                    "Could not reach Anthropic — check your internet connection.",
+                    raw=str(exc),
+                )
+            )
+            return
         except APIError as exc:
             message = getattr(exc, "message", str(exc))
-            raise ProviderError(
-                f"Anthropic error: {message}",
-                raw=str(exc),
-            ) from exc
+            yield StreamFailed(
+                ProviderError(
+                    f"Anthropic error: {message}",
+                    raw=str(exc),
+                )
+            )
+            return
         except Exception as exc:
-            raise ProviderError(
-                f"Unexpected error calling Anthropic: {exc}",
-                raw=str(exc),
-            ) from exc
+            yield StreamFailed(
+                ProviderError(
+                    f"Unexpected error opening Anthropic stream: {exc}",
+                    raw=str(exc),
+                )
+            )
+            return
 
-        latency = time.monotonic() - start
+        # ---------- Stream is open. Iterate events. ----------
+        # From here on, any errors are caught and converted to
+        # StreamFailed events; we never let exceptions escape the
+        # generator. The cm.__exit__ in finally guarantees the SDK
+        # connection is closed regardless of how we exit. Probe 4
+        # confirmed get_final_message() is callable AFTER cm.__exit__.
+        served_model_emitted = False
 
-        # Anthropic returns content as a list of blocks. For a normal text
-        # response there's one block with .type == "text" and .text == "...".
-        # For code-execution responses there are also server_tool_use blocks
-        # (Claude writing code) and bash_code_execution_tool_result blocks
-        # (the code's output) interleaved with text. We collect every
-        # text block and concatenate them — the user-visible answer is
-        # spread across explanation-of-intent text + final-summary text
-        # with tool blocks between.
+        try:
+            for event in stream:
+                # Cancellation check between events. If the user clicks
+                # Stop, we close the SDK stream (server stops sending
+                # tokens — no more billing for tokens we'd never show),
+                # yield StreamCancelled, and return. The finally block
+                # below also calls cm.__exit__ for full cleanup.
+                if cancel_flag.is_set():
+                    try:
+                        stream.close()
+                    except Exception:
+                        # Best-effort close; cm.__exit__ in finally is
+                        # the real cleanup.
+                        pass
+                    yield StreamCancelled()
+                    return
+
+                # Map SDK events to our StreamEvent types. Anthropic's
+                # streaming events are typed objects from anthropic.types.
+                # We handle the two we care about explicitly; all other
+                # event types (RawContentBlockStartEvent,
+                # RawContentBlockStopEvent, RawMessageDeltaEvent,
+                # RawMessageStopEvent) are silently consumed because the
+                # SDK accumulates everything we need into the final
+                # message, which we read after iteration.
+                if isinstance(event, RawMessageStartEvent):
+                    # First event of every stream. Carries the model
+                    # name on event.message (verified via Probe 2).
+                    # Emit StreamStarted exactly once.
+                    if not served_model_emitted:
+                        served_model = (
+                            getattr(event.message, "model", None)
+                            or request.model.api_model_name
+                        )
+                        yield StreamStarted(model=served_model)
+                        served_model_emitted = True
+
+                elif isinstance(event, RawContentBlockDeltaEvent):
+                    # Workhorse event. Each one carries an incremental
+                    # piece of a content block. For text blocks the
+                    # event.delta is a TextDelta (Anthropic's, not ours)
+                    # with a .text attribute holding the new chunk
+                    # (verified via Probe 2). For tool_use blocks (code
+                    # execution intermediate), the delta carries other
+                    # fields (input_json_delta, etc.) which we silently
+                    # consume in v0.2.0 — they appear correctly in the
+                    # final ChatResponse via the SDK's get_final_message
+                    # accumulation. Using getattr() rather than direct
+                    # attribute access so we don't crash on unexpected
+                    # delta variants.
+                    delta = getattr(event, "delta", None)
+                    if delta is not None:
+                        text = getattr(delta, "text", None)
+                        if text:
+                            yield TextDelta(text=text)
+
+        except AnthropicRateLimitError as exc:
+            # Mid-stream rate limit. Extremely rare for Anthropic but
+            # possible in theory. Per design: do NOT retry mid-stream —
+            # surface as failure.
+            yield StreamFailed(
+                RateLimitError(
+                    "Anthropic rate limited mid-response.",
+                    raw=str(exc),
+                )
+            )
+            return
+        except APIError as exc:
+            message = getattr(exc, "message", str(exc))
+            yield StreamFailed(
+                ProviderError(
+                    f"Anthropic error during stream: {message}",
+                    raw=str(exc),
+                )
+            )
+            return
+        except Exception as exc:
+            yield StreamFailed(
+                ProviderError(
+                    f"Unexpected error during Anthropic stream: {exc}",
+                    raw=str(exc),
+                )
+            )
+            return
+        finally:
+            # ALWAYS exit the context manager. Probe 4 confirmed this
+            # leaves the MessageStream in a state where get_final_message
+            # is still callable, so we exit BEFORE assembling the
+            # ChatResponse below.
+            try:
+                cm.__exit__(None, None, None)
+            except Exception:
+                # Cleanup errors are non-fatal — connection will be
+                # closed eventually by GC if SDK fails to close it now.
+                pass
+
+        # ---------- Stream completed. Assemble ChatResponse. ----------
+        # The SDK has accumulated all content blocks (text + any tool
+        # use) into a final ParsedMessage object. Probe 1 confirmed
+        # get_final_message returns ParsedMessage with .model, .content,
+        # .usage. Probe 4 confirmed it's callable AFTER cm.__exit__.
+        try:
+            final_message = stream.get_final_message()
+        except Exception as exc:
+            # If get_final_message itself fails (extremely unlikely after
+            # successful iteration), surface as failure rather than
+            # fabricate a partial ChatResponse.
+            yield StreamFailed(
+                ProviderError(
+                    f"Failed to assemble final response: {exc}",
+                    raw=str(exc),
+                )
+            )
+            return
+
+        # Same content-parsing logic the legacy complete() used. We
+        # iterate every block in final_message.content and pick out
+        # text. For a normal text response there's one ParsedTextBlock
+        # (verified Probe 1). For code-execution responses there are
+        # also tool_use blocks (Claude writing code) and tool_result
+        # blocks (the code's output) interleaved with text. The
+        # user-visible answer is the union of all text blocks joined
+        # with blank lines. The hasattr check tolerates non-text blocks
+        # without crashing.
         text_parts: list[str] = []
-        for block in response.content or []:
+        for block in final_message.content or []:
             if hasattr(block, "text") and block.text:
                 text_parts.append(block.text)
         text = "\n\n".join(text_parts)
 
-        usage = response.usage
+        usage = final_message.usage
         input_tokens = usage.input_tokens if usage else 0
         output_tokens = usage.output_tokens if usage else 0
-
         cost = calculate_cost_usd(request.model, input_tokens, output_tokens)
 
-        return ChatResponse(
+        # Emit the Usage event before StreamCompleted. The UI updates
+        # its token-count label on this event. We could merge this
+        # into StreamCompleted, but separate events keep the protocol
+        # clean and let providers that emit usage mid-stream — none do
+        # today, but in v0.2.x some might — fit naturally.
+        yield Usage(input_tokens=input_tokens, output_tokens=output_tokens)
+
+        latency = time.monotonic() - start
+
+        final_response = ChatResponse(
             text=text,
             latency_seconds=latency,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost,
-            served_model=response.model or request.model.api_model_name,
+            served_model=final_message.model or request.model.api_model_name,
         )
+        yield StreamCompleted(final_response=final_response)
 
     # ---------- Internal helpers ----------
 
