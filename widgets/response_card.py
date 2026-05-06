@@ -5,6 +5,7 @@ State machine:
     EMPTY     -> no request yet, card shows a dim placeholder
     LOADING   -> request is queued or in flight, no events yet, spinner-y badge
     STREAMING -> events are arriving from the provider, body fills in live
+                 with debounced markdown→HTML rendering (v0.2.0)
     COMPLETE  -> stream finished cleanly, body shows full answer + metrics
     ERROR     -> stream errored out, card shows the error message
     CANCELLED -> user clicked Stop mid-stream; partial text preserved,
@@ -12,34 +13,28 @@ State machine:
 
 A copy-to-clipboard button in the header copies the response body.
 The button is enabled only in the COMPLETE state and shows a brief
-checkmark confirmation when clicked. (Streaming and cancelled states
-leave the copy button disabled — partial text is incomplete; copying
-it would be confusing. The user can still select-and-Ctrl-C from the
-text widget directly if they really want to.)
+checkmark confirmation when clicked.
 
-Caveats: when set_response is called with caveats (e.g. "this provider
-only saw 1 of 2 attached files"), they appear in italic grey text
-between the answer body and the metrics footer. Hidden when no caveats
-are present and in non-COMPLETE states.
+v0.2.0 incremental rendering
+----------------------------
+During streaming, chunks accumulate in _stream_buffer. A debounced
+QTimer fires every _STREAM_RENDER_MS (default 250ms) and re-renders
+the entire buffer as markdown→HTML via setHtml. Tables, headings,
+code blocks, and bold/italic appear formatted as the response streams
+in — much closer to claude.ai's experience than waiting until
+completion to render.
 
-v0.2.0 streaming
-----------------
-The card supports live text streaming via four new methods that the
-ComparisonView calls in response to dispatcher streaming signals:
-
-    start_streaming(model_name)         — STREAMING state, body cleared
-    append_stream_text(chunk)           — append a text chunk live
-    update_stream_usage(input, output)  — update token metric mid-stream
-    set_cancelled()                     — CANCELLED state, body preserved
-
-The existing set_response / set_error / set_loading / reset / set_badge
-methods are unchanged in shape and behaviour. Streaming is additive:
-during a normal Run the sequence is set_loading -> start_streaming ->
-many append_stream_text -> update_stream_usage -> set_response (which
-writes the authoritative final text from ChatResponse, replacing the
-streamed buffer). The "snap" from streamed text to authoritative text
-at completion should be invisible in practice — the SDK assembles the
-final text from the same deltas we received.
+Trade-offs:
+- Re-render is full-document each time (markdown parsing is global —
+  you can't append HTML for "the new bit" without context). Fine in
+  practice; markdown is fast for typical response sizes.
+- Mild flicker every 250ms during the re-render. Acceptable.
+- First 250ms of a stream may briefly show as raw markdown before
+  the first render kicks in. Minor.
+- Scroll position preservation: if user is near the bottom (within
+  5px of max), they stay at the bottom (auto-follow stream). If
+  they've scrolled up to read earlier content, their position is
+  preserved so they don't get yanked back.
 """
 from enum import Enum
 
@@ -64,8 +59,7 @@ from models import ModelInfo, Provider
 
 # SVG icons for the copy button. Defined inline so we don't bundle
 # extra asset files and the icons render identically on every OS via
-# Qt's SVG renderer. The currentColor pattern means the icon picks
-# up its color from the surrounding stylesheet.
+# Qt's SVG renderer.
 _COPY_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
 fill="none" stroke="#A0A0A0" stroke-width="2" stroke-linecap="round"
 stroke-linejoin="round">
@@ -92,40 +86,6 @@ def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     return QIcon(pixmap)
 
 
-class CardState(str, Enum):
-    """Which phase of the request/response cycle the card is in.
-
-    Six states, ordered by typical lifecycle:
-        EMPTY     - card just created, no request yet
-        LOADING   - request dispatched, waiting for first event
-        STREAMING - events arriving, body filling in live (v0.2.0)
-        COMPLETE  - terminal happy path
-        ERROR     - terminal error path
-        CANCELLED - terminal cancelled path (user clicked Stop) (v0.2.0)
-    """
-
-    EMPTY = "empty"
-    LOADING = "loading"
-    STREAMING = "streaming"
-    COMPLETE = "complete"
-    ERROR = "error"
-    CANCELLED = "cancelled"
-
-
-# Provider accent colors — used for the initial letter badge.
-PROVIDER_COLORS = {
-    Provider.OPENAI:       ("#0F2E20", "#10A37F"),  # (bg, fg)
-    Provider.AZURE_OPENAI: ("#0F1E35", "#4A90E2"),
-    Provider.ANTHROPIC:    ("#2A1A10", "#D97757"),
-    Provider.GOOGLE:       ("#0F1E35", "#4A90E2"),
-    Provider.XAI:          ("#1A1A1A", "#EDEDED"),
-    Provider.LOCAL:        ("#1A1A1A", "#8A8A8A"),
-}
-
-
-import markdown
-
-
 # ---------- CSS for rendered response body ----------
 #
 # Applied to the QTextEdit body in both streaming and completion states.
@@ -133,11 +93,6 @@ import markdown
 # tables, code blocks, and basic spacing. Background color matches
 # BG_CARD so the body blends with the card; teal accent matches the
 # GOLD brand color.
-#
-# QTextEdit does NOT support: flexbox, transitions, hover states,
-# box-shadow, or advanced selectors. For pixel-perfect claude.ai-style
-# rendering we would need QWebEngineView (Chromium) — not worth the
-# Mac packaging complexity for v0.2.0.
 
 _RESPONSE_CSS = """
 body {
@@ -162,7 +117,7 @@ h2 {
     font-weight: 600;
     line-height: 1.3;
     color: #EDEDED;
-    margin: 14px 0 4px 0;
+    margin: 4px 0 4px 0;
     padding: 0;
 }
 h3 {
@@ -264,20 +219,47 @@ blockquote {
 def _wrap_with_css(body_content: str) -> str:
     """Wrap an HTML/text body in a full styled HTML document.
 
-    Used by both streaming (plain text inside styled body) and
-    completion (markdown-rendered HTML inside styled body) paths.
-    QTextEdit's setHtml accepts a full document or a fragment; we
-    use a full document so the <style> block is recognized and
-    applied. The body content is inserted as-is — for streaming
-    paths it's plain text; for completion paths it's rendered
-    markdown HTML.
+    Used by both streaming (rendered markdown HTML inside styled body)
+    and completion (final markdown-rendered HTML inside styled body)
+    paths. QTextEdit's setHtml accepts a full document or a fragment;
+    we use a full document so the <style> block is recognized and
+    applied.
     """
     return f"<html><head><style>{_RESPONSE_CSS}</style></head><body>{body_content}</body></html>"
 
 
+# How often (in milliseconds) to re-render the streaming buffer as
+# markdown→HTML. Lower = smoother incremental rendering but more
+# CPU and visible flicker. Higher = less work but slower visual
+# updates. 250ms is a good middle ground — feels live without
+# being janky.
+_STREAM_RENDER_MS = 250
+
+
+class CardState(str, Enum):
+    """Which phase of the request/response cycle the card is in."""
+
+    EMPTY = "empty"
+    LOADING = "loading"
+    STREAMING = "streaming"
+    COMPLETE = "complete"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+
+# Provider accent colors — used for the initial letter badge.
+PROVIDER_COLORS = {
+    Provider.OPENAI:       ("#0F2E20", "#10A37F"),  # (bg, fg)
+    Provider.AZURE_OPENAI: ("#0F1E35", "#4A90E2"),
+    Provider.ANTHROPIC:    ("#2A1A10", "#D97757"),
+    Provider.GOOGLE:       ("#0F1E35", "#4A90E2"),
+    Provider.XAI:          ("#1A1A1A", "#EDEDED"),
+    Provider.LOCAL:        ("#1A1A1A", "#8A8A8A"),
+}
+
+
 class ResponseCard(QFrame):
     """Visual card for one provider's response in a comparison run."""
-
 
     # Fires when the user clicks the regenerate button — payload = model_id.
     regenerate_requested = Signal(str)
@@ -290,9 +272,7 @@ class ResponseCard(QFrame):
 
         self.setObjectName("card")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        
 
-        
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -310,8 +290,6 @@ class ResponseCard(QFrame):
         root.addWidget(self._body, stretch=1)
 
         # ---------- Caveats (hidden by default) ----------
-        # Sits between body and footer. Italic grey text. Wraps. Visible
-        # only when caveats are present and the card is in COMPLETE state.
         self._caveats_label = QLabel("")
         self._caveats_label.setObjectName("cardCaveat")
         self._caveats_label.setWordWrap(True)
@@ -326,6 +304,18 @@ class ResponseCard(QFrame):
         self._footer = self._build_footer()
         root.addWidget(self._footer)
 
+        # ---------- Streaming render state ----------
+        # Chunks arrive on stream_text_delta; we accumulate them in
+        # _stream_buffer and re-render markdown to HTML via _render_timer
+        # at most every _STREAM_RENDER_MS milliseconds. This gives
+        # incremental claude.ai-style rendering during the stream
+        # without thrashing setHtml on every chunk (which would flicker
+        # and lose scroll position).
+        self._stream_buffer = ""
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._render_stream_buffer)
+
         self._apply_state()
 
     # ---------- Building blocks ----------
@@ -339,7 +329,7 @@ class ResponseCard(QFrame):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(10)
 
-        # Provider initial badge — colored square with the first letter
+        # Provider initial badge
         initial = self._model.label[0].upper()
         bg, fg = PROVIDER_COLORS.get(self._model.provider, ("#1A1A1A", "#EDEDED"))
 
@@ -374,12 +364,7 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(False)
         layout.addWidget(self._status_badge)
 
-       # Copy button — copies the response body to clipboard.
-        # Enabled only in COMPLETE state. Shows a checkmark icon for
-        # ~1.5s after click as confirmation, then reverts. Uses an
-        # inline SVG icon so it renders identically on Windows and
-        # macOS (avoids font-glyph fallback issues with Unicode
-        # symbols on macOS).
+        # Copy button
         self._copy_icon_default = _svg_to_icon(_COPY_ICON_SVG, size=16)
         self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
 
@@ -415,7 +400,7 @@ class ResponseCard(QFrame):
         return footer
 
     def _make_metric(self, label_text: str, value_text: str) -> QWidget:
-        """A small label-over-value column, used for latency / tokens / cost."""
+        """A small label-over-value column."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -436,14 +421,9 @@ class ResponseCard(QFrame):
     # ---------- Public API — called from the Compare view ----------
 
     def set_loading(self) -> None:
-        """Mark the card as waiting on a response.
-
-        Called from ComparisonView right after the Run button is
-        clicked, before any provider events have arrived. The brief
-        moment between dispatch and the first stream_started event
-        lives here. As soon as start_streaming() is called, the card
-        leaves LOADING for STREAMING.
-        """
+        """Mark the card as waiting on a response."""
+        self._render_timer.stop()
+        self._stream_buffer = ""
         self._state = CardState.LOADING
         self._body.setPlaceholderText("Generating response...")
         self._body.clear()
@@ -453,14 +433,22 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def start_streaming(self, model_name: str) -> None:
-        """..."""
+        """Transition into the STREAMING state.
+
+        Resets the streaming buffer and the styled body. Subsequent
+        append_stream_text calls accumulate chunks in _stream_buffer;
+        the debounced _render_timer converts the buffer to rendered
+        markdown every _STREAM_RENDER_MS so the user sees incremental
+        updates (tables forming, headings rendered) rather than raw
+        markdown source. set_response at completion still applies the
+        final authoritative render.
+
+        Stops any pending render timer from a prior stream so we don't
+        get a stale render arriving after a new stream has started.
+        """
         self._state = CardState.STREAMING
-        # Establish the styled empty body. Subsequent append_stream_text
-        # calls insert plain text inside this styled document, so the
-        # streaming text picks up the body's font, color, and line-height
-        # from the CSS. Markdown characters (|, #, **) appear literally
-        # during streaming — they'll be rendered properly when set_response
-        # finalizes the card with markdown→HTML conversion.
+        self._stream_buffer = ""
+        self._render_timer.stop()
         self._body.setHtml(_wrap_with_css(""))
         self._body.setPlaceholderText("")
         self._update_metrics("—", "—", "—")
@@ -469,55 +457,84 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def append_stream_text(self, chunk: str) -> None:
-        """Append a streamed text chunk to the body.
+        """Append a streamed text chunk to the buffer.
 
-        Called once per dispatcher stream_text_delta signal. Uses
-        QTextCursor positioned at the end of the document so we
-        insert without re-rendering the whole text — efficient even
-        for hundreds of chunks per second. After insertion, scrolls
-        the view to the bottom so the latest text is always visible.
+        Called once per dispatcher stream_text_delta signal. Instead
+        of inserting the chunk directly into the body (which would
+        show raw markdown source like '|' and '#' until completion),
+        we append to _stream_buffer and start a debounced timer.
+        Every _STREAM_RENDER_MS, _render_stream_buffer converts the
+        accumulated buffer to rendered HTML — so the user sees
+        tables form, headings render, code blocks appear with proper
+        styling as the response streams.
 
         No-op if the card is not in STREAMING state. This guards
         against late deltas arriving after the card has already
-        transitioned to COMPLETE / ERROR / CANCELLED — the dispatcher
-        layer should not deliver these in correct operation, but a
-        defensive check keeps the UI stable if it ever does.
+        transitioned to COMPLETE / ERROR / CANCELLED.
         """
         if self._state != CardState.STREAMING:
             return
         if not chunk:
             return
 
-        # Insert at the end of the document. Using a cursor positioned
-        # at End is the canonical Qt pattern for streaming append; it
-        # avoids re-flowing the entire document the way setPlainText
-        # would, and preserves any selection the user has elsewhere
-        # in the text.
-        cursor = self._body.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self._body.setTextCursor(cursor)
-        self._body.insertPlainText(chunk)
+        self._stream_buffer += chunk
 
-        # Always auto-scroll to the bottom for v0.2.0. A future polish
-        # step will detect "user has scrolled up to read" and skip the
-        # auto-scroll in that case (claude.ai-style behaviour). For
-        # now: simple, predictable, latest text always visible.
-        scroll_bar = self._body.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
+        # Start the timer if not already running. Once started, more
+        # chunks arriving during the wait window are simply added to
+        # the buffer; the timer fires once and renders everything
+        # accumulated. This is the debounce — bursts of chunks
+        # produce one render, not one per chunk.
+        if not self._render_timer.isActive():
+            self._render_timer.start(_STREAM_RENDER_MS)
+
+    def _render_stream_buffer(self) -> None:
+        """Render the accumulated streaming buffer as markdown→HTML.
+
+        Called by _render_timer every _STREAM_RENDER_MS during streaming.
+        Converts the entire accumulated buffer (not just new chunks) to
+        HTML and replaces the body. This is full re-render, not
+        incremental, because markdown's parsing is inherently global —
+        you can't append HTML for "the new bit" without context.
+
+        Scroll position handling: if the user is at the bottom of the
+        view (auto-scroll mode), we keep them there after the re-render.
+        If they've scrolled up to read earlier text, we preserve their
+        scroll position so the re-render doesn't yank them back to the
+        bottom mid-read.
+
+        No-op if the card has transitioned out of STREAMING state — a
+        late timer firing after stream completion would corrupt the
+        final rendered state set by set_response.
+        """
+        if self._state != CardState.STREAMING:
+            return
+        if not self._stream_buffer:
+            return
+
+        # Save scroll position. We check whether the user is "near the
+        # bottom" (within 5px) — if so, they're following the stream
+        # and we should keep them at the bottom after re-render.
+        # Otherwise they're reading earlier text and we preserve their
+        # scroll position.
+        scrollbar = self._body.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
+        prior_position = scrollbar.value()
+
+        # Render the accumulated buffer.
+        html = markdown.markdown(
+            self._stream_buffer,
+            extensions=["tables", "fenced_code", "nl2br"],
+        )
+        self._body.setHtml(_wrap_with_css(html))
+
+        # Restore scroll position after setHtml (which resets to top).
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(prior_position)
 
     def update_stream_usage(self, input_tokens: int, output_tokens: int) -> None:
-        """Update the token metric mid-stream.
-
-        Called once per dispatcher stream_usage signal. Most providers
-        emit usage near or at the end of a stream, so this typically
-        fires shortly before set_response is called. The token counter
-        flips from "—" to the real numbers a moment before completion.
-
-        No-op if the card is not in STREAMING state. As with
-        append_stream_text, this is defensive — late events shouldn't
-        arrive but if they do, ignore them rather than corrupt a
-        completed/cancelled card's display.
-        """
+        """Update the token metric mid-stream."""
         if self._state != CardState.STREAMING:
             return
         total = input_tokens + output_tokens
@@ -531,17 +548,22 @@ class ResponseCard(QFrame):
         cost_usd: float,
         caveats: tuple[str, ...] = (),
     ) -> None:
-        
+        """Populate the card with a successful response.
+
+        Stops any pending streaming-render timer (so a stale render
+        doesn't overwrite our final state), then sets the authoritative
+        final HTML. In normal operation the final render matches the
+        last streaming render closely — the user sees a smooth
+        transition rather than a "snap."
+        """
+        self._render_timer.stop()
         self._state = CardState.COMPLETE
 
         # Render markdown to HTML so tables, headers, lists, and code
         # blocks display properly. The 'tables' extension handles
         # markdown table syntax; 'fenced_code' handles ```code blocks```;
         # 'nl2br' converts single newlines to <br> so the rendered
-        # output matches claude.ai's line-break behavior. We use
-        # setHtml() instead of setPlainText() — QTextEdit's rich-text
-        # mode handles the HTML and the clipboard automatically gets
-        # both HTML and plain-text formats.
+        # output matches claude.ai's line-break behavior.
         html = markdown.markdown(
             text,
             extensions=["tables", "fenced_code", "nl2br"],
@@ -558,12 +580,17 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_error(self, message: str) -> None:
-        """..."""
+        """Show an error state on the card.
+
+        Stops any pending render timer, then replaces the body with
+        the error message. Any partial streamed content is overwritten
+        — for an error case, showing partial text alongside the error
+        would be confusing.
+        """
+        self._render_timer.stop()
         self._state = CardState.ERROR
         # Use styled body so error text picks up the same typography
-        # as success responses. Wrapping in a <p> tag makes the error
-        # message a proper paragraph rather than raw text appended to
-        # the body root.
+        # as success responses.
         error_html = f"<p>Error: {message}</p>"
         self._body.setHtml(_wrap_with_css(error_html))
         self._update_metrics("—", "—", "—")
@@ -572,20 +599,21 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_cancelled(self) -> None:
-        """Mark the card as cancelled by the user (Stop pressed mid-stream).
+        """Mark the card as cancelled by the user.
 
         Called from ComparisonView when the dispatcher's stream_cancelled
-        signal fires. UNLIKE set_error, this preserves whatever partial
-        text was already streamed into the body — the user explicitly
+        signal fires. Stops the render timer but PRESERVES whatever
+        partial rendered text was last shown — the user explicitly
         chose to stop and presumably wants to see what they got. The
         STOPPED badge in the header signals the cancellation. Metrics
         stay as-is (token count from update_stream_usage if it arrived,
         otherwise dashes; latency and cost stay dashes since the stream
         didn't complete).
         """
+        self._render_timer.stop()
         self._state = CardState.CANCELLED
-        # Body text is preserved as-is — whatever streamed in before
-        # the user clicked Stop. No call to setPlainText or clear().
+        # Body content is preserved as-is — whatever was last rendered
+        # before the user clicked Stop.
         self._set_status("STOPPED", accent=False)
         self._apply_state()
 
@@ -595,6 +623,8 @@ class ResponseCard(QFrame):
 
     def reset(self) -> None:
         """Return the card to its empty state."""
+        self._render_timer.stop()
+        self._stream_buffer = ""
         self._state = CardState.EMPTY
         self._body.clear()
         self._body.setPlaceholderText("Waiting for prompt...")
@@ -617,14 +647,11 @@ class ResponseCard(QFrame):
         self._cost_metric.value_label.setText(cost)
 
     def _set_caveats(self, caveats: tuple[str, ...]) -> None:
-        """Show or hide the caveats label. Multiple caveats are joined
-        with newlines so each appears on its own line."""
+        """Show or hide the caveats label."""
         if not caveats:
             self._caveats_label.setVisible(False)
             self._caveats_label.setText("")
             return
-        # Each caveat on its own line, prefixed with a soft bullet so
-        # multi-caveat cases read clearly.
         text = "\n".join(f"• {c}" for c in caveats)
         self._caveats_label.setText(text)
         self._caveats_label.setVisible(True)
@@ -641,19 +668,21 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Enable/disable copy button based on whether a response exists.
-
-        Copy is enabled ONLY in COMPLETE state. STREAMING and CANCELLED
-        leave it disabled because the buffer is incomplete (streaming)
-        or partial (cancelled) — copying it would set the user up for
-        confusion. Power users can still select+Ctrl-C from the text
-        widget directly if they want partial text.
-        """
+        """Enable/disable copy button based on whether a response exists."""
         is_complete = self._state == CardState.COMPLETE
         self._copy_button.setEnabled(is_complete)
 
     def _on_copy(self) -> None:
-        
+        """Copy the response body to the system clipboard, preserving
+        rich-text formatting.
+
+        Uses QTextEdit.selectAll() + .copy() rather than reading
+        toPlainText() and calling clipboard.setText(). The difference
+        matters for tables, headers, and lists: QTextEdit.copy() puts
+        BOTH HTML and plain-text formats on the clipboard, so:
+          - Pasting into Word/Outlook → HTML format → tables render
+          - Pasting into Notepad/terminal → plain-text fallback
+        """
         if not self._body.toPlainText():
             return
         self._body.selectAll()
