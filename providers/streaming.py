@@ -12,10 +12,10 @@ Two lifetimes, side by side
 The streaming protocol intentionally keeps two views of a model's reply:
 
 1. Transient view — the streaming events themselves.
-   StreamStarted, TextDelta, Usage, StreamFailed, StreamCancelled are
-   driven by the SDK as the response is generated. They exist to drive
-   live UI updates ("text growing word by word", "token counter
-   appearing"). Once consumed, they are gone.
+   StreamStarted, StreamThinking, TextDelta, Usage, StreamFailed,
+   StreamCancelled are driven by the SDK as the response is generated.
+   They exist to drive live UI updates ("text growing word by word",
+   "token counter appearing"). Once consumed, they are gone.
 
 2. Durable view — ChatResponse, carried in StreamCompleted at the end.
    This is HECTOR's existing representation of a complete model reply
@@ -57,10 +57,10 @@ __init__, __repr__, __eq__ also remove boilerplate.
 Open for extension
 ------------------
 The hierarchy is designed to grow. When v0.3.0 adds tool use, new event
-types (ToolCallStarted, ToolCallResult, ThinkingDelta) are added here
-without modifying any existing event. Consumers that don't recognise the
-new events fall through their match/isinstance checks and ignore them —
-no existing code breaks. This is the Open/Closed Principle in practice.
+types (ToolCallStarted, ToolCallResult) are added here without modifying
+any existing event. Consumers that don't recognise the new events fall
+through their match/isinstance checks and ignore them — no existing code
+breaks. This is the Open/Closed Principle in practice.
 
 This file has no logic — only data definitions. It does not import Qt,
 any provider SDK, or any module with runtime side effects. It is safe to
@@ -91,24 +91,59 @@ class StreamEvent:
 
 # ---------------------------------------------------------------------------
 # Concrete event types, ordered by their typical position in a stream:
-# Started -> (TextDelta x N, Usage) -> Completed   [happy path]
-# Started -> (TextDelta x N) -> Failed             [error path]
-# Started -> (TextDelta x N) -> Cancelled          [user pressed Stop]
+#
+# No-thinking providers (Anthropic, OpenAI):
+#   Started -> (TextDelta x N, Usage) -> Completed   [happy path]
+#   Started -> (TextDelta x N) -> Failed             [error path]
+#   Started -> (TextDelta x N) -> Cancelled          [user pressed Stop]
+#
+# Thinking providers (Gemini 2.5 Flash with thinking enabled):
+#   Thinking -> Started -> (TextDelta x N, Usage) -> Completed
+#   Thinking -> Failed                               [error before any text]
+#   Thinking -> Cancelled                            [user pressed Stop while reasoning]
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class StreamStarted(StreamEvent):
     """
-    Emitted once at the start of a stream, after the HTTP connection is
-    established and the provider has acknowledged the request. The UI
-    uses this to flip the response card from "queued" into "streaming"
-    state (cursor visible, text area cleared) and optionally to confirm
-    which model the provider actually routed to (sometimes differs from
-    what was requested).
+    Emitted once at the start of visible text generation, after the HTTP
+    connection is established and the provider has acknowledged the
+    request. For providers without internal reasoning (Anthropic, OpenAI)
+    this is the very first event of the stream. For thinking providers
+    (Gemini 2.5 Flash) StreamThinking is yielded first; StreamStarted
+    arrives only when the first visible text chunk is about to follow.
+
+    The UI uses this to flip the response card into "streaming" state
+    (cursor visible, text area cleared) and optionally to confirm which
+    model the provider actually routed to (sometimes differs from what
+    was requested).
     """
 
     model: str
+
+
+@dataclass(frozen=True)
+class StreamThinking(StreamEvent):
+    """
+    Emitted by providers that reason internally before producing visible
+    text (e.g. Gemini 2.5 Flash with default thinking enabled). Signals
+    "stream is open, model is reasoning, no visible output yet". The UI
+    shows a THINKING badge during this phase so the user understands
+    the wait is intentional, not a hang.
+
+    For Gemini specifically: yielded immediately after the SDK stream
+    opens. Reasoning typically takes 5+ seconds before any chunk with
+    text arrives. Providers without exposed reasoning (Anthropic, OpenAI)
+    do not emit this event — they go straight to StreamStarted on the
+    first text chunk.
+
+    The UI handler transitions the card from LOADING to a THINKING state
+    that shows a "THINKING" badge. When the first TextDelta arrives the
+    card transitions to STREAMING via StreamStarted.
+    """
+
+    pass
 
 
 @dataclass(frozen=True)
@@ -138,7 +173,13 @@ class Usage(StreamEvent):
     counter the moment the data arrives, even if a few more text deltas
     follow afterwards.
 
-    The UI handler updates the card's "input / output" token label.
+    For thinking providers, output_tokens INCLUDES reasoning tokens —
+    we are honest about full cost, not just visible-text cost. The user
+    is paying for reasoning whether they see it or not, and a comparison
+    tool that hides this would underreport Gemini's true cost vs Claude
+    or GPT.
+
+    The UI handler updates the card's token label.
     """
 
     input_tokens: int

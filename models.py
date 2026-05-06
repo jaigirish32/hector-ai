@@ -72,14 +72,14 @@ DEFAULT_MODELS: list[ModelInfo] = [
         output_cost_per_1m=0.60,
     ),
     ModelInfo(
-    id="gemini-2.5-flash",        # internal id stays for stability
-    label="Gemini Flash (latest)", # honest label about behavior
+    id="gemini-3.1-pro",
+    label="Gemini 3.1 Pro",
     provider=Provider.GOOGLE,
-    api_model_name="gemini-flash-latest",  # alias — always newest
+    api_model_name="gemini-3.1-pro-preview",
     supports_images=True,
     context_window=1_000_000,
-    input_cost_per_1m=0.30,        # approximate — may shift
-    output_cost_per_1m=2.50,
+    input_cost_per_1m=2.00,
+    output_cost_per_1m=12.00,
     enabled=True,
     ),
     ModelInfo(

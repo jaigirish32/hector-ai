@@ -22,11 +22,18 @@ v0.2.0 streaming
 ----------------
 Each worker now consumes the provider's complete_stream() event
 iterator instead of calling complete(). Streaming events
-(StreamStarted, TextDelta, Usage) are re-emitted as Qt signals during
-the stream, so the UI can update live. The terminal events
-(StreamCompleted, StreamFailed, StreamCancelled) drive the existing
-_pending_count countdown — exactly one terminal per worker, same as
-before, just with a third option (cancellation) added.
+(StreamStarted, StreamThinking, TextDelta, Usage) are re-emitted as
+Qt signals during the stream, so the UI can update live. The terminal
+events (StreamCompleted, StreamFailed, StreamCancelled) drive the
+existing _pending_count countdown.
+
+StreamThinking is emitted only by providers that reason internally
+before producing visible text (Gemini 2.5 Flash). For those providers
+the sequence is StreamThinking -> StreamStarted (when first text is
+about to arrive) -> TextDelta x N -> Usage -> StreamCompleted. For
+non-thinking providers the StreamThinking event is never emitted; the
+sequence is StreamStarted -> TextDelta x N -> Usage -> StreamCompleted
+as before. Either way, the worker re-emits whatever events arrive.
 
 Cancellation: each worker is given its own threading.Event before it
 starts. The dispatcher exposes cancel(model_id) which sets that
@@ -47,8 +54,7 @@ expiring and the dispatcher's full destruction).
 During the migration: providers that have not yet implemented
 complete_stream() inherit the default body from BaseProviderClient
 which raises NotImplementedError. The worker catches this and emits a
-clean failure to the UI. So an un-migrated provider shows "not yet
-migrated to streaming" in its card while migrated ones stream live.
+clean failure to the UI.
 """
 from __future__ import annotations
 
@@ -69,6 +75,7 @@ from providers.base import (
     FileRef,
     ProviderError,
 )
+from providers._dbg import dbg
 from providers.gemini_client import GeminiClient
 from providers.openai_client import OpenAIClient
 from providers.streaming import (
@@ -76,11 +83,12 @@ from providers.streaming import (
     StreamCompleted,
     StreamFailed,
     StreamStarted,
+    StreamThinking,
     TextDelta,
     Usage,
 )
 from settings_manager import SettingsManager
-from providers._dbg import dbg
+
 
 _PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
     Provider.OPENAI: "openai",
@@ -104,6 +112,7 @@ class _WorkerSignals(QObject):
     # Streaming signals — fired DURING the stream, before the terminal.
     # These never decrement _pending_count; they only drive live UI updates.
     stream_started = Signal(str, str)                # (model_id, served_model_name)
+    stream_thinking = Signal(str)                    # (model_id) — provider is reasoning, no text yet
     stream_text_delta = Signal(str, str)             # (model_id, text_chunk)
     stream_usage = Signal(str, int, int)             # (model_id, input_tokens, output_tokens)
 
@@ -147,20 +156,7 @@ class _ProviderWorker(QRunnable):
 
     def _safe_emit(self, bound_signal, *args) -> bool:
         """Emit a signal, returning True on success, False if the signal
-        source has been destroyed.
-
-        The race we are guarding against: during app shutdown, the
-        dispatcher's _signals (a QObject) can be destroyed while a
-        worker thread is still inside run(). The next emit attempt then
-        raises RuntimeError('Signal source has been deleted'). Catching
-        it here and returning False lets the caller stop processing
-        further events and unwind cleanly to the finally block.
-
-        This complements Dispatcher.shutdown(), which cancels workers
-        and waits up to a few seconds for them to exit. _safe_emit is
-        the safety net for the residual race when the wait expires
-        before the worker's loop reaches its next cancel-flag check.
-        """
+        source has been destroyed."""
         try:
             bound_signal.emit(*args)
             return True
@@ -171,11 +167,6 @@ class _ProviderWorker(QRunnable):
         model_id = self._request.model.id
         dbg("WORKER", f"{model_id} run START")
         try:
-            # Iterate the provider's stream. Each event is matched to the
-            # appropriate Qt signal. Terminal events (StreamCompleted,
-            # StreamFailed, StreamCancelled) emit their signal then return
-            # immediately, ensuring exactly one terminal is emitted even
-            # if (against contract) the provider yields more events after.
             for event in self._client.complete_stream(self._request, self._cancel_flag):
                 if isinstance(event, StreamStarted):
                     dbg("WORKER", f"{model_id} got StreamStarted")
@@ -183,6 +174,13 @@ class _ProviderWorker(QRunnable):
                         self._signals.stream_started, model_id, event.model
                     ):
                         return  # dispatcher gone — exit cleanly
+
+                elif isinstance(event, StreamThinking):
+                    dbg("WORKER", f"{model_id} got StreamThinking")
+                    if not self._safe_emit(
+                        self._signals.stream_thinking, model_id
+                    ):
+                        return
 
                 elif isinstance(event, TextDelta):
                     if not self._safe_emit(
@@ -232,7 +230,8 @@ class _ProviderWorker(QRunnable):
                     return  # terminal
 
                 # Unknown event type: ignore, keep iterating. Future event
-                # types (e.g. v0.3.0 tool events) added here as needed.
+                # types added to streaming.py will fall through here until
+                # explicit branches are added — defensive default.
 
         except NotImplementedError:
             dbg("WORKER", f"{model_id} NotImplementedError")
@@ -279,6 +278,7 @@ class Dispatcher(QObject):
     # to these; existing code that only handles completion can stay on
     # response_received / response_failed.
     stream_started = Signal(str, str)                   # (model_id, served_model_name)
+    stream_thinking = Signal(str)                       # (model_id) — provider reasoning
     stream_text_delta = Signal(str, str)                # (model_id, text_chunk)
     stream_usage = Signal(str, int, int)                # (model_id, input_tokens, output_tokens)
     stream_cancelled = Signal(str)                      # (model_id) — terminal
@@ -326,6 +326,7 @@ class Dispatcher(QObject):
         # it can both re-emit and decrement _pending_count, mirroring the
         # pattern of _on_worker_succeeded / _on_worker_failed.
         self._signals.stream_started.connect(self.stream_started.emit)
+        self._signals.stream_thinking.connect(self.stream_thinking.emit)
         self._signals.stream_text_delta.connect(self.stream_text_delta.emit)
         self._signals.stream_usage.connect(self.stream_usage.emit)
         self._signals.stream_cancelled.connect(self._on_worker_cancelled)
@@ -333,45 +334,13 @@ class Dispatcher(QObject):
     # ---------- Public cancellation API ----------
 
     def cancel(self, model_id: str) -> None:
-        """Tell the worker for the given model to stop streaming.
-
-        Sets that worker's threading.Event. The provider client's
-        complete_stream() implementation is required to check the flag
-        between events and yield StreamCancelled when set, then close
-        the underlying SDK stream cleanly. Idempotent — calling twice
-        on the same model is a no-op (Event.set() is idempotent).
-
-        Has no effect if no worker for this model is currently running
-        (e.g. cancel called after the stream already completed). The
-        UI should not rely on the worker being still alive.
-        """
+        """Tell the worker for the given model to stop streaming."""
         flag = self._cancel_flags.get(model_id)
         if flag is not None:
             flag.set()
 
-    def shutdown(self, timeout_ms: int = 3000) -> None:
-        """Cancel all active workers and wait briefly for them to exit.
-
-        Called during app shutdown from MainWindow.closeEvent and from
-        QApplication.aboutToQuit (belt and suspenders — closeEvent
-        catches the normal close-button path, aboutToQuit catches any
-        other exit path like Ctrl+C or OS-forced quit).
-
-        The flow:
-          1. Set every active worker's cancel_flag. Workers observe the
-             flag between SDK events and exit via StreamCancelled.
-          2. Wait up to timeout_ms for the threadpool to drain. Workers
-             stuck in retry-sleep won't observe the flag until the sleep
-             finishes — accepted edge case for v0.2.0; Step 7's retry
-             helper rework will make retry-sleep cancellation-aware.
-          3. Disconnect our signal slots. Even if a worker is still alive
-             at this point and emits a signal, the slot side has nothing
-             listening, so nothing breaks. _ProviderWorker._safe_emit
-             handles the worker side.
-
-        Idempotent — multiple calls do nothing after the first. Safe to
-        wire to both closeEvent and aboutToQuit.
-        """
+    def shutdown(self, timeout_ms: int = 1500) -> None:
+        """Cancel all active workers and wait briefly for them to exit."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
@@ -380,22 +349,20 @@ class Dispatcher(QObject):
         for flag in self._cancel_flags.values():
             flag.set()
 
-        # Step 2: wait briefly for workers to exit. Note this blocks the
-        # main thread — but only for up to timeout_ms — so the UI is
-        # frozen for that window during shutdown. Acceptable: the user
-        # has already chosen to close the app.
+        # Step 2: wait briefly for workers to exit.
         self._pool.waitForDone(timeout_ms)
 
         # Step 3: best-effort signal disconnection. Wrapped in try/except
         # because disconnect() raises if the signal was never connected
-        # (or already disconnected) — both are fine in this teardown
-        # path. We don't care about completing all disconnects; we just
-        # want as many as possible to succeed.
+        # (or already disconnected). We only disconnect signals we
+        # actually wired to internal slots — `finished` was never
+        # connected internally, so attempting to disconnect it produces
+        # a benign RuntimeWarning we don't need.
         for sig in (
             self._signals.succeeded,
             self._signals.failed,
-            self._signals.finished,
             self._signals.stream_started,
+            self._signals.stream_thinking,
             self._signals.stream_text_delta,
             self._signals.stream_usage,
             self._signals.stream_cancelled,
@@ -417,18 +384,7 @@ class Dispatcher(QObject):
         max_tokens: int = 2048,
         system_prompt: str = "",
     ) -> None:
-        """Fan out using file_refs that the caller has already resolved.
-
-        attached_file_ids is the list of file_ids the user has selected
-        in the sidebar for this Run. The dispatcher uses it to detect:
-          - Zero coverage: model gets a structured response_failed.
-          - Partial coverage: model is dispatched with a caveat that
-            will appear under its answer.
-          - Full coverage: model is dispatched normally.
-
-        If attached_file_ids is None or empty, the pre-flight check is
-        skipped — preserves existing behaviour for text-only Runs.
-        """
+        """Fan out using file_refs that the caller has already resolved."""
         if self._pending_count > 0:
             return
 
@@ -463,8 +419,6 @@ class Dispatcher(QObject):
             # Pre-flight check only matters when files are attached.
             if expected_file_count > 0:
                 if n_refs == 0:
-                    # Zero coverage. The model would have nothing to look
-                    # at and any answer would be a hallucination — skip.
                     skipped_jobs.append((
                         model_id,
                         f"This provider doesn't natively support any of the "
@@ -475,9 +429,6 @@ class Dispatcher(QObject):
                     continue
 
                 if n_refs < expected_file_count:
-                    # Partial coverage. Dispatch with what we have, and
-                    # attach a caveat so the user sees that this provider
-                    # only saw a subset of the files.
                     missing = expected_file_count - n_refs
                     pre_caveats = (
                         f"This provider only saw {n_refs} of "
@@ -528,11 +479,7 @@ class Dispatcher(QObject):
         system_prompt: str = "",
         file_paths: list[Path] | None = None,
     ) -> None:
-        """Fan out by resolving file paths at run time via the orchestrator.
-
-        Kept for any caller that still passes raw file_paths. The new
-        attach-at-upload-time flow uses dispatch_with_resolved_refs.
-        """
+        """Fan out by resolving file paths at run time via the orchestrator."""
         if self._pending_count > 0:
             return
 
@@ -582,7 +529,6 @@ class Dispatcher(QObject):
             return
 
         self._pending_count = len(runnable_jobs)
-        # Fresh per-Run cancel flags (same pattern as dispatch_with_resolved_refs).
         self._cancel_flags = {}
         for model_id, request, client in runnable_jobs:
             cancel_flag = threading.Event()
@@ -603,10 +549,6 @@ class Dispatcher(QObject):
         self._decrement_pending()
 
     def _on_worker_cancelled(self, model_id: str) -> None:
-        # Mirrors _on_worker_succeeded / _on_worker_failed: re-emit the
-        # public signal upward to the UI, then decrement the countdown.
-        # Without this, cancellations would leak _pending_count and the
-        # dispatcher would refuse all subsequent Runs.
         self.stream_cancelled.emit(model_id)
         self._decrement_pending()
 
@@ -614,10 +556,6 @@ class Dispatcher(QObject):
         self._pending_count -= 1
         if self._pending_count <= 0:
             self._pending_count = 0
-            # Run is fully done — drop all per-worker cancel flags.
-            # If we don't clear here, stale flags from this Run hang
-            # around in memory until the next Run replaces the dict.
-            # Cheap to clear, safer to clear.
             self._cancel_flags.clear()
             self.all_complete.emit()
 
@@ -628,65 +566,3 @@ class Dispatcher(QObject):
             return f"File error ({err.file_path.name}): {err.message}"
         lines = [f"{e.file_path.name}: {e.message}" for e in errors]
         return "File errors:\n" + "\n".join(lines)
-    
-    def shutdown(self, timeout_ms: int = 1500) -> None:
-        """Cancel all active workers and wait briefly for them to exit.
-
-        Called during app shutdown from MainWindow.closeEvent and from
-        QApplication.aboutToQuit (belt and suspenders — closeEvent
-        catches the normal close-button path, aboutToQuit catches any
-        other exit path like Ctrl+C or OS-forced quit).
-
-        The flow:
-          1. Set every active worker's cancel_flag. Workers responsive
-             to the flag (between SDK events) exit cleanly within a
-             fraction of a second.
-          2. Wait up to timeout_ms for the threadpool to drain.
-          3. Disconnect our signal slots so any late emits from workers
-             that didn't exit in time become silent no-ops.
-
-        Workers stuck in retry-sleep or inside a blocking SDK call do
-        NOT observe the cancel flag and will outlive this method. They
-        keep the QThreadPool's threads busy, which keeps the Python
-        process alive after app.exec() returns. The os._exit() call in
-        main.py handles that — by the time we get there, the user has
-        already chosen to close the app, so force-exit is acceptable.
-        Step 7 will make the retry helper cancellation-aware so the
-        Stop-button case (app stays open, one provider cancelled)
-        works gracefully even with retry-sleeping workers.
-
-        Idempotent — multiple calls do nothing after the first. Safe to
-        wire to both closeEvent and aboutToQuit.
-        """
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-
-        # Step 1: cancel every active worker.
-        for flag in self._cancel_flags.values():
-            flag.set()
-
-        # Step 2: wait briefly for workers to exit. Note this blocks the
-        # main thread for up to timeout_ms — UI is frozen for that
-        # window during shutdown. Acceptable: the user has already
-        # chosen to close the app.
-        self._pool.waitForDone(timeout_ms)
-
-        # Step 3: best-effort signal disconnection. Wrapped in try/except
-        # because disconnect() raises if the signal was never connected
-        # (or already disconnected). We only disconnect signals we
-        # actually wired to internal slots — `finished` was never
-        # connected internally, so attempting to disconnect it produces
-        # a benign RuntimeWarning we don't need.
-        for sig in (
-            self._signals.succeeded,
-            self._signals.failed,
-            self._signals.stream_started,
-            self._signals.stream_text_delta,
-            self._signals.stream_usage,
-            self._signals.stream_cancelled,
-        ):
-            try:
-                sig.disconnect()
-            except (RuntimeError, TypeError):
-                pass
