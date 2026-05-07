@@ -220,8 +220,8 @@ if sys.platform == "darwin":
             # Bundle identity.
             "CFBundleName": "HECTOR-AI",
             "CFBundleDisplayName": "HECTOR-AI",
-            "CFBundleVersion": "0.1.10",
-            "CFBundleShortVersionString": "0.1.10",
+            "CFBundleVersion": "v1.0.0-rc1",
+            "CFBundleShortVersionString": "v1.0.0-rc1",
             # Tell macOS this is a regular GUI app, not a tool.
             "LSApplicationCategoryType": "public.app-category.developer-tools",
             # Allow the app to run on Apple Silicon natively.
