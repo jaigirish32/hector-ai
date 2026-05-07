@@ -184,6 +184,7 @@ class ComparisonView(QWidget):
 
         for index, model in enumerate(models):
             card = ResponseCard(model)
+            card.cancel_requested.connect(self._on_cancel_requested)
             self._cards[model.id] = card
 
             row = index // 2
@@ -298,6 +299,12 @@ class ComparisonView(QWidget):
         if card is None:
             return
         card.set_cancelled()
+
+    def _on_cancel_requested(self, model_id: str) -> None:
+        """User clicked Stop on a card. Tell the dispatcher to cancel
+        that worker. The dispatcher will eventually emit stream_cancelled
+        which routes back to the card's set_cancelled()."""
+        self._dispatcher.cancel(model_id)
 
     # ---------- Shutdown ----------
 

@@ -34,6 +34,10 @@ stroke-linejoin="round">
 <polyline points="20 6 9 17 4 12"/>
 </svg>"""
 
+_STOP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+fill="#A0A0A0" stroke="none">
+<rect x="6" y="6" width="12" height="12" rx="2"/>
+</svg>"""
 
 def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     """Render an SVG string into a QIcon."""
@@ -184,14 +188,16 @@ class CardState(str, Enum):
 
     Typical paths:
       EMPTY → LOADING → STREAMING → COMPLETE
-      EMPTY → LOADING → THINKING → STREAMING → COMPLETE  (Gemini)
-      Any → ERROR / CANCELLED
+      EMPTY → LOADING → THINKING → STREAMING → COMPLETE  (Gemini, Anthropic)
+      Any active state → CANCELLING → CANCELLED  (user clicked Stop)
+      Any → ERROR
     """
 
     EMPTY = "empty"
     LOADING = "loading"
     THINKING = "thinking"
     STREAMING = "streaming"
+    CANCELLING = "cancelling"
     COMPLETE = "complete"
     ERROR = "error"
     CANCELLED = "cancelled"
@@ -212,6 +218,7 @@ class ResponseCard(QFrame):
     """One provider's response card in a comparison run."""
 
     regenerate_requested = Signal(str)
+    cancel_requested = Signal(str)
 
     def __init__(self, model: ModelInfo) -> None:
         super().__init__()
@@ -306,6 +313,19 @@ class ResponseCard(QFrame):
 
         self._copy_icon_default = _svg_to_icon(_COPY_ICON_SVG, size=16)
         self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
+        self._stop_icon = _svg_to_icon(_STOP_ICON_SVG, size=14)
+
+        # Stop and Copy share the same slot — only one is visible at a time.
+        # Stop appears during LOADING/THINKING/STREAMING; Copy after COMPLETE.
+        self._stop_button = QPushButton()
+        self._stop_button.setIcon(self._stop_icon)
+        self._stop_button.setObjectName("stopButton")
+        self._stop_button.setFixedSize(32, 28)
+        self._stop_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._stop_button.setToolTip("Stop generating")
+        self._stop_button.clicked.connect(self._on_stop)
+        self._stop_button.setVisible(False)
+        layout.addWidget(self._stop_button)
 
         self._copy_button = QPushButton()
         self._copy_button.setIcon(self._copy_icon_default)
@@ -450,7 +470,14 @@ class ResponseCard(QFrame):
         cost_usd: float,
         caveats: tuple[str, ...] = (),
     ) -> None:
-        """Final authoritative render at completion."""
+        """Final authoritative render at completion.
+
+        Race guard: if the user clicked Stop and we're CANCELLING/CANCELLED,
+        a late-arriving completion event must not flip the card back to
+        COMPLETE. The cancel wins.
+        """
+        if self._state in (CardState.CANCELLING, CardState.CANCELLED):
+            return
         self._render_timer.stop()
         self._state = CardState.COMPLETE
 
@@ -481,7 +508,7 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_cancelled(self) -> None:
-        """User stopped mid-stream. Preserves whatever was rendered."""
+        """Dispatcher confirmed cancellation. Preserves whatever was rendered."""
         self._render_timer.stop()
         self._state = CardState.CANCELLED
         self._set_status("STOPPED", accent=False)
@@ -534,8 +561,25 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Copy button enabled only in COMPLETE state."""
+        """Toggle Stop and Copy buttons based on current state.
+
+        Stop is visible during active states (LOADING/THINKING/STREAMING).
+        It is disabled once clicked (CANCELLING) to prevent double-clicks.
+        Copy is visible only after successful completion.
+        """
+        active_states = (
+            CardState.LOADING,
+            CardState.THINKING,
+            CardState.STREAMING,
+        )
+        is_active = self._state in active_states
+        is_cancelling = self._state == CardState.CANCELLING
         is_complete = self._state == CardState.COMPLETE
+
+        self._stop_button.setVisible(is_active or is_cancelling)
+        self._stop_button.setEnabled(is_active)
+
+        self._copy_button.setVisible(not (is_active or is_cancelling))
         self._copy_button.setEnabled(is_complete)
 
     def _on_copy(self) -> None:
@@ -549,6 +593,21 @@ class ResponseCard(QFrame):
         self._body.setTextCursor(cursor)
         self._copy_button.setIcon(self._copy_icon_done)
         QTimer.singleShot(1500, self._revert_copy_icon)
+    
+    def _on_stop(self) -> None:
+        """User clicked Stop. Move to CANCELLING (button greys out),
+        emit signal so ComparisonView can call dispatcher.cancel.
+        Card will move to CANCELLED when StreamCancelled arrives."""
+        if self._state not in (
+            CardState.LOADING,
+            CardState.THINKING,
+            CardState.STREAMING,
+        ):
+            return
+        self._state = CardState.CANCELLING
+        self._set_status("STOPPING", accent=False)
+        self._apply_state()
+        self.cancel_requested.emit(self._model.id)
 
     def _revert_copy_icon(self) -> None:
         self._copy_button.setIcon(self._copy_icon_default)

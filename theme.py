@@ -142,6 +142,36 @@ def _build_stylesheet() -> str:
         border: 1px solid {c.GOLD};
     }}
 
+    /* ===== Card header buttons (copy + stop) =====
+       These two share the same slot in the response card header — only
+       one is visible at a time. Copy after completion; Stop while
+       generating. Both styled identically for visual consistency, with
+       the Stop hover taking a destructive-action accent so users feel
+       the click weight before pressing.
+    */
+    QPushButton#copyButton, QPushButton#stopButton {{
+        background-color: transparent;
+        border: 1px solid {c.BORDER};
+        border-radius: 6px;
+        padding: 0;
+    }}
+    QPushButton#copyButton:hover {{
+        background-color: {c.BG_CARD_HOVER};
+        border: 1px solid {c.BORDER_HOVER};
+    }}
+    QPushButton#copyButton:disabled {{
+        border: 1px solid {c.BORDER};
+        background-color: transparent;
+    }}
+    QPushButton#stopButton:hover {{
+        background-color: {c.BG_CARD_HOVER};
+        border: 1px solid {c.ERROR};
+    }}
+    QPushButton#stopButton:disabled {{
+        border: 1px solid {c.BORDER};
+        background-color: transparent;
+    }}
+
     /* ===== Primary button (gold, for Run / main actions) ===== */
     QPushButton#primary {{
         background-color: {c.GOLD};
