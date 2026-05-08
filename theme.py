@@ -452,6 +452,31 @@ def _build_stylesheet() -> str:
         border-radius: 5px;
     }}
 
+    /* ===== Scroll areas — defensive Mac fix =====
+       On macOS, QScrollArea and QAbstractScrollArea-derived widgets
+       inherit a white background by default unless given an explicit
+       rule. Windows defaults dark-ish so the bug is invisible there.
+       These rules force transparent on every scroll area; targeted
+       rules below explicitly paint the sidebar background where
+       transparency isn't enough (the FILES list).
+    */
+    QScrollArea {{
+        background-color: transparent;
+        border: 0;
+    }}
+    QAbstractScrollArea {{
+        background-color: transparent;
+    }}
+
+    /* ===== File library panel (sidebar FILES section) ===== */
+    QScrollArea#filesRowsScroll {{
+        background-color: {c.BG_SIDEBAR};
+        border: 0;
+    }}
+    QWidget#filesRowsContainer {{
+        background-color: {c.BG_SIDEBAR};
+    }}
+
     /* ===== Scrollbars (subtle, minimal) ===== */
     QScrollBar:vertical {{
         background: transparent;
