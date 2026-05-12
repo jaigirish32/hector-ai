@@ -69,7 +69,7 @@ class PromptArea(QFrame):
         )
         pdf_only_note.setWordWrap(True)
         pdf_only_note.setStyleSheet(
-            "color: #F87171; font-size: 11px; font-style: italic; padding: 0 2px;"
+            "color: #F87171; font-size: 14px; font-style: italic; padding: 0 2px;"
         )
         root.addWidget(pdf_only_note)
 

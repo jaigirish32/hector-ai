@@ -236,13 +236,29 @@ class FileLibraryPanel(QWidget):
         )
         if not paths:
             return
-        # Queue all picked paths and process them one at a time. The
-        # button stays disabled (via _set_busy) for the entire batch,
-        # so the user can't queue a second batch on top.
+        self.queue_uploads([Path(p) for p in paths])
+
+    def queue_uploads(self, paths: list[Path]) -> bool:
+        """Public entry for queuing uploads from any source.
+
+        Used by the "+ Add file" button (via _on_add_clicked) and by
+        the main window's drag-and-drop handler. Returns True if the
+        upload batch started, False if the panel is busy (the caller
+        can decide how to surface that — a status message, a beep,
+        or silently ignore).
+
+        Serial upload via _kick_next_upload — same constraint as the
+        button path: one file at a time to avoid SQLite races in
+        FileRegistry. The UI is disabled for the duration of the
+        batch via _set_busy.
+        """
+        if self._busy or not paths:
+            return False
         self._set_busy(True)
         self._pending_uploads = len(paths)
-        self._upload_queue = [Path(p) for p in paths]
+        self._upload_queue = list(paths)
         self._kick_next_upload()
+        return True
 
     def _kick_next_upload(self) -> None:
         """Start the next queued upload, or finish the batch if empty.

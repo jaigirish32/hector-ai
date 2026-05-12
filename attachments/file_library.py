@@ -180,11 +180,19 @@ class FileLibrary:
         for ref in existing_refs:
             uploader = self._uploaders.get(ref.provider)
             if uploader is None:
-                failures[ref.provider] = "No uploader available"
+                # Provider was retired between this file's upload and now
+                # (e.g. azure_openai was removed in v1.0). The ref row is
+                # an orphan we can't clean up at the provider end. Treat
+                # as already-cleaned so the local registry drops the row.
+                successes.append(ref.provider)
                 continue
 
             if not uploader.is_configured():
-                failures[ref.provider] = "Provider not configured"
+                # Configured at upload time, not configured now (e.g. user
+                # removed the API key). Same situation as a retired
+                # provider — we can't reach the provider to clean up, but
+                # there's nothing the user can do about it either.
+                successes.append(ref.provider)
                 continue
 
             try:

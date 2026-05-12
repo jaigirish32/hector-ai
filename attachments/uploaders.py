@@ -286,29 +286,10 @@ class GeminiUploader(BaseUploader):
         )
 
     def delete(self, remote_id: str) -> None:
-        # ===== TEMP DEBUG — remove before release =====
-        import sys
-        print(f"\n[DELETE-DEBUG] GeminiUploader.delete called", file=sys.stderr, flush=True)
-        print(f"[DELETE-DEBUG] remote_id: {remote_id!r}", file=sys.stderr, flush=True)
-        print(f"[DELETE-DEBUG] is_configured(): {self.is_configured()}", file=sys.stderr, flush=True)
-        # ==================================================
-
         if not self.is_configured():
             raise NotConfiguredError("Google API key not set.")
 
         api_key = self._settings.get_secret(SecretKey.GOOGLE_API_KEY)
-
-        # ===== TEMP DEBUG — remove before release =====
-        print(f"[DELETE-DEBUG] api_key length: {len(api_key)}", file=sys.stderr, flush=True)
-        print(f"[DELETE-DEBUG] api_key prefix: {api_key[:6] if api_key else 'EMPTY'}", file=sys.stderr, flush=True)
-        print(f"[DELETE-DEBUG] settings instance id: {id(self._settings)}", file=sys.stderr, flush=True)
-        from settings_manager import SettingsManager
-        sm_check = SettingsManager()
-        check_key = sm_check.get_secret(SecretKey.GOOGLE_API_KEY)
-        print(f"[DELETE-DEBUG] fresh SM key length: {len(check_key)}", file=sys.stderr, flush=True)
-        print(f"[DELETE-DEBUG] fresh SM instance id: {id(sm_check)}", file=sys.stderr, flush=True)
-        # ==================================================
-
         client = genai.Client(api_key=api_key)
 
         # Gemini's delete API expects the resource name (e.g. 'files/abc-xyz'),
@@ -323,15 +304,6 @@ class GeminiUploader(BaseUploader):
             client.files.delete(name=name)
         except genai_errors.APIError as exc:
             status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-            # ===== TEMP DEBUG — remove before release =====
-            import sys
-            print(f"[DELETE-DEBUG] Google API rejected delete", file=sys.stderr, flush=True)
-            print(f"[DELETE-DEBUG] status: {status}", file=sys.stderr, flush=True)
-            print(f"[DELETE-DEBUG] full exception type: {type(exc).__name__}", file=sys.stderr, flush=True)
-            print(f"[DELETE-DEBUG] full exception: {exc}", file=sys.stderr, flush=True)
-            print(f"[DELETE-DEBUG] exception dir: {[a for a in dir(exc) if not a.startswith('_')]}", file=sys.stderr, flush=True)
-            print(f"[DELETE-DEBUG] message: {getattr(exc, 'message', 'NO MESSAGE')}", file=sys.stderr, flush=True)
-            # ==================================================
             if status == 404:
                 return  # Already gone
             self._translate_error(exc)
