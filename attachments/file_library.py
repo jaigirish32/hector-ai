@@ -29,11 +29,11 @@ from pathlib import Path
 from attachments.registry import FileRecord, FileRegistry
 from attachments.uploaders import (
     AnthropicUploader,
-    AzureOpenAIUploader,
     BaseUploader,
     GeminiUploader,
     OpenAIUploader,
     ProviderUploadResult,
+    XAIUploader,
 )
 from providers.base import FileRef
 from routing.router import RoutingPlan, route
@@ -46,7 +46,7 @@ _UPLOADER_CLASSES: dict[str, type[BaseUploader]] = {
     "anthropic": AnthropicUploader,
     "gemini": GeminiUploader,
     "openai": OpenAIUploader,
-    "azure_openai": AzureOpenAIUploader,
+    "xai": XAIUploader,
 }
 
 
@@ -191,7 +191,22 @@ class FileLibrary:
                 uploader.delete(ref.remote_id)
                 successes.append(ref.provider)
             except Exception as exc:
-                failures[ref.provider] = str(exc)
+                msg = str(exc)
+                # 403 (no permission to this file) and 404 (not found)
+                # are permanent — retry won't help. Treat them as "the
+                # file is no longer ours to delete" and let the local
+                # registry drop the row. The provider's copy is
+                # effectively orphaned, but that's already true.
+                permanent = (
+                    "PERMISSION_DENIED" in msg
+                    or "permission to access" in msg
+                    or "not found" in msg.lower()
+                    or "404" in msg
+                )
+                if permanent:
+                    successes.append(ref.provider)
+                else:
+                    failures[ref.provider] = msg
 
         # If all providers succeeded (or had no refs), delete the local
         # file record entirely (cascade removes provider_file_refs rows).

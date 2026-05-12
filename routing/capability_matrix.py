@@ -98,15 +98,12 @@ CAPABILITY_MATRIX: dict[tuple[str, str], Capability] = {
     ("openai", "jpeg"): Capability(Strategy.NATIVE, fidelity=3, max_size_mb=20),
 
     # -------------------- Azure OpenAI --------------------
-    # purpose="assistants" — does NOT accept xlsx or csv even though OpenAI
-    # proper does. Lags upstream OpenAI on file types as of 2026-04.
-    # Code Interpreter on Azure Responses API documented but xlsx upload
-    # to Azure Files API still rejected per Microsoft Q&A as recently as
-    # 2025; treat as UNSUPPORTED until empirically verified.
-    ("azure_openai", "pdf"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=50,
-                                         notes="vision + text extraction"),
-    ("azure_openai", "png"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=20),
-    ("azure_openai", "jpeg"): Capability(Strategy.NATIVE, fidelity=3, max_size_mb=20),
+    # Azure OpenAI section removed in v1.0 — the GPT-4.1 chip was retired
+    # in favor of Grok 4.20 from xAI. AzureOpenAIUploader class is kept
+    # in attachments/uploaders.py as dead code, but no live wiring uses it.
+    # If Azure is restored as a provider later, restore the section here
+    # and re-add the class to _UPLOADER_CLASSES in file_library.py and
+    # orchestrator.py.
 
     # -------------------- Anthropic --------------------
     # PDF/images via 'document' content blocks (files-api beta).
@@ -154,10 +151,15 @@ CAPABILITY_MATRIX: dict[tuple[str, str], Capability] = {
     # Files API + input_file blocks (OpenAI-compatible). Per xAI docs,
     # supported types include txt, md, code, csv, json, pdf. xlsx is NOT
     # listed — marked UNSUPPORTED. Vision is jpg/png only (no webp/gif).
-    ("grok", "pdf"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=48),
-    ("grok", "csv"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=48),
-    ("grok", "png"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=20),
-    ("grok", "jpeg"): Capability(Strategy.NATIVE, fidelity=3, max_size_mb=20),
+    # -------------------- xAI (Grok) --------------------
+    # Files API + input_file blocks (OpenAI-compatible). Per xAI docs,
+    # supported types include txt, md, code, csv, json, pdf. xlsx is NOT
+    # listed — marked UNSUPPORTED. Vision is jpg/png only (no webp/gif).
+    # Provider key is "xai" to match dispatcher, file_library, orchestrator,
+    # and views/comparison_view — provider identity is xAI, "grok" is the
+    # model name. v1 routes only PDF to xai per the phased plan
+    # (Phase 2: csv. Phase 3: images via input_image).
+    ("xai", "pdf"):  Capability(Strategy.NATIVE, fidelity=3, max_size_mb=48),
 }
 
 

@@ -60,6 +60,19 @@ class PromptArea(QFrame):
         self._prompt_input.textChanged.connect(self._update_char_counter)
         root.addWidget(self._prompt_input)
 
+        # File-format helper note. Sits between the prompt and the models
+        # row so it reads as guidance about the attached file, not about
+        # the prompt. Red + italic to signal a constraint, but small font
+        # to keep visual weight low — it's a note, not a warning.
+        pdf_only_note = QLabel(
+            "Please note that all files that are attached should be in PDF format."
+        )
+        pdf_only_note.setWordWrap(True)
+        pdf_only_note.setStyleSheet(
+            "color: #F87171; font-size: 11px; font-style: italic; padding: 0 2px;"
+        )
+        root.addWidget(pdf_only_note)
+
         # ---------- Section 2: model chips row ----------
         chips_row = QHBoxLayout()
         chips_row.setSpacing(6)

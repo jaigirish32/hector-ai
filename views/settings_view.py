@@ -41,30 +41,6 @@ PROVIDER_SECTIONS: list[tuple[str, list[FieldSpec]]] = [
         ],
     ),
     (
-        "Azure OpenAI",
-        [
-            FieldSpec(
-                secret_key=SecretKey.AZURE_OPENAI_API_KEY,
-                label="API key",
-                placeholder="Paste your Azure OpenAI key",
-                helper="Found in Azure Portal → your OpenAI resource → Keys and Endpoint.",
-            ),
-            FieldSpec(
-                secret_key=SecretKey.AZURE_OPENAI_ENDPOINT,
-                label="Endpoint URL",
-                placeholder="https://your-resource.openai.azure.com/",
-                helper="The full resource URL from the same Azure page.",
-            ),
-            FieldSpec(
-                secret_key=f"{SecretKey.AZURE_OPENAI_DEPLOYMENT_PREFIX}gpt-4.1-azure",
-                label="Deployment name for GPT-4.1",
-                placeholder="e.g. gpt-4.1",
-                helper="The deployment name you configured in Azure Portal for this model. "
-                       "Case-sensitive. Required — there is no default.",
-            ),
-        ],
-    ),
-    (
         "Anthropic (Claude)",
         [
             FieldSpec(
@@ -83,6 +59,18 @@ PROVIDER_SECTIONS: list[tuple[str, list[FieldSpec]]] = [
                 label="API key",
                 placeholder="AIza...",
                 helper="Free tier available at aistudio.google.com → Get API key.",
+            ),
+        ],
+    ),
+    (
+        "xAI (Grok)",
+        [
+            FieldSpec(
+                secret_key=SecretKey.XAI_API_KEY,
+                label="API key",
+                placeholder="xai-...",
+                helper="Generate at console.x.ai → API keys. "
+                       "The key needs access to grok-4.20-0309-reasoning.",
             ),
         ],
     ),

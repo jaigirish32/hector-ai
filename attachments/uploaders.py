@@ -286,10 +286,29 @@ class GeminiUploader(BaseUploader):
         )
 
     def delete(self, remote_id: str) -> None:
+        # ===== TEMP DEBUG — remove before release =====
+        import sys
+        print(f"\n[DELETE-DEBUG] GeminiUploader.delete called", file=sys.stderr, flush=True)
+        print(f"[DELETE-DEBUG] remote_id: {remote_id!r}", file=sys.stderr, flush=True)
+        print(f"[DELETE-DEBUG] is_configured(): {self.is_configured()}", file=sys.stderr, flush=True)
+        # ==================================================
+
         if not self.is_configured():
             raise NotConfiguredError("Google API key not set.")
 
         api_key = self._settings.get_secret(SecretKey.GOOGLE_API_KEY)
+
+        # ===== TEMP DEBUG — remove before release =====
+        print(f"[DELETE-DEBUG] api_key length: {len(api_key)}", file=sys.stderr, flush=True)
+        print(f"[DELETE-DEBUG] api_key prefix: {api_key[:6] if api_key else 'EMPTY'}", file=sys.stderr, flush=True)
+        print(f"[DELETE-DEBUG] settings instance id: {id(self._settings)}", file=sys.stderr, flush=True)
+        from settings_manager import SettingsManager
+        sm_check = SettingsManager()
+        check_key = sm_check.get_secret(SecretKey.GOOGLE_API_KEY)
+        print(f"[DELETE-DEBUG] fresh SM key length: {len(check_key)}", file=sys.stderr, flush=True)
+        print(f"[DELETE-DEBUG] fresh SM instance id: {id(sm_check)}", file=sys.stderr, flush=True)
+        # ==================================================
+
         client = genai.Client(api_key=api_key)
 
         # Gemini's delete API expects the resource name (e.g. 'files/abc-xyz'),
@@ -304,15 +323,19 @@ class GeminiUploader(BaseUploader):
             client.files.delete(name=name)
         except genai_errors.APIError as exc:
             status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            # ===== TEMP DEBUG — remove before release =====
+            import sys
+            print(f"[DELETE-DEBUG] Google API rejected delete", file=sys.stderr, flush=True)
+            print(f"[DELETE-DEBUG] status: {status}", file=sys.stderr, flush=True)
+            print(f"[DELETE-DEBUG] full exception type: {type(exc).__name__}", file=sys.stderr, flush=True)
+            print(f"[DELETE-DEBUG] full exception: {exc}", file=sys.stderr, flush=True)
+            print(f"[DELETE-DEBUG] exception dir: {[a for a in dir(exc) if not a.startswith('_')]}", file=sys.stderr, flush=True)
+            print(f"[DELETE-DEBUG] message: {getattr(exc, 'message', 'NO MESSAGE')}", file=sys.stderr, flush=True)
+            # ==================================================
             if status == 404:
                 return  # Already gone
             self._translate_error(exc)
             raise
-        except Exception as exc:
-            raise ProviderError(
-                f"Unexpected error deleting from Gemini: {exc}",
-                raw=str(exc),
-            ) from exc
 
     # ---------- Internals ----------
 
@@ -357,9 +380,19 @@ class GeminiUploader(BaseUploader):
         status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
         message = getattr(exc, "message", str(exc))
 
-        if status in (401, 403):
+        if status == 401:
             raise AuthenticationError(
                 "Google rejected the API key.",
+                raw=str(exc),
+            ) from exc
+        if status == 403:
+            # Distinguish "key denied" from "this specific file isn't
+            # accessible to this key" — Google returns 403 for both.
+            # Files in the Gemini Files API are scoped to the uploading
+            # key/project; a key change orphans previously-uploaded files.
+            raise ProviderError(
+                f"Google denied access to this file. The file was likely "
+                f"uploaded with a different API key. Original error: {message}",
                 raw=str(exc),
             ) from exc
         if status == 429:
@@ -618,5 +651,133 @@ class AzureOpenAIUploader(BaseUploader):
         except Exception as exc:
             raise ProviderError(
                 f"Unexpected error deleting from Azure: {exc}",
+                raw=str(exc),
+            ) from exc
+        
+
+# ---------- xAI (Grok) uploader ----------
+
+# xAI's Files API at /v1/files. OpenAI-compatible: same SDK, just a
+# different base_url. Verified Apr 2026 via probe_grok_files.py.
+#
+# Phase 1 scope: PDF only. xAI accepts the OpenAI 'user_data' purpose
+# and returns a FileObject with .id, .filename, .bytes — same shape as
+# OpenAI. Documents are read inline by Grok's reasoning model, not via
+# agentic search (verified — round-trip on FAR#6 PDF returned content
+# clearly drawn from the document).
+#
+# Phase 2 will widen the MIME whitelist to docx/xlsx/csv/txt; Phase 3
+# will add image support via input_image (different code path — xAI
+# images go inline as URL/base64, not as uploaded file_ids).
+
+XAI_BASE_URL = "https://api.x.ai/v1"
+XAI_FILE_PURPOSE = "user_data"
+
+# Phase 1 whitelist — only PDFs are routed to xAI today. Anything else
+# raises ProviderError before hitting the network. Widen this set in
+# Phase 2 (add docx/xlsx/csv/txt) and Phase 3 (image handling moves to
+# the chat client, not this uploader).
+_XAI_SUPPORTED_MIMES = frozenset({
+    "application/pdf",
+})
+
+
+class XAIUploader(BaseUploader):
+    provider_name = "xai"
+
+    def __init__(self, settings: SettingsManager | None = None) -> None:
+        self._settings = settings or SettingsManager()
+
+    def is_configured(self) -> bool:
+        return self._settings.has_secret(SecretKey.XAI_API_KEY)
+
+    def upload(self, file_path: Path, mime_type: str) -> ProviderUploadResult:
+        if not self.is_configured():
+            raise NotConfiguredError(
+                "xAI API key not set. Go to Settings to add it."
+            )
+
+        # Phase 1: refuse everything except PDF before opening the file.
+        # The dispatcher's partial-coverage caveat path will surface this
+        # to the user as "this provider doesn't natively support the file".
+        if mime_type not in _XAI_SUPPORTED_MIMES:
+            raise ProviderError(
+                f"xAI v1 only supports PDF files. "
+                f"This file's type ({mime_type}) is not yet routed to Grok."
+            )
+
+        api_key = self._settings.get_secret(SecretKey.XAI_API_KEY)
+        client = OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+
+        path = Path(file_path).resolve()
+        if not path.exists():
+            raise ProviderError(f"File not found: {path}")
+
+        try:
+            with open(path, "rb") as fh:
+                response = client.files.create(
+                    file=fh,
+                    purpose=XAI_FILE_PURPOSE,
+                )
+        except OpenAIAuthError as exc:
+            raise AuthenticationError(
+                "xAI rejected the API key during upload.",
+                raw=str(exc),
+            ) from exc
+        except OpenAIRateLimitError as exc:
+            raise RateLimitError(
+                "xAI rate limit hit during upload. Wait and retry.",
+                raw=str(exc),
+            ) from exc
+        except OpenAIConnectionError as exc:
+            raise ProviderError(
+                "Could not reach xAI — check your internet connection.",
+                raw=str(exc),
+            ) from exc
+        except OpenAIAPIError as exc:
+            message = getattr(exc, "message", str(exc))
+            raise ProviderError(
+                f"xAI upload error: {message}",
+                raw=str(exc),
+            ) from exc
+        except Exception as exc:
+            raise ProviderError(
+                f"Unexpected error uploading to xAI: {exc}",
+                raw=str(exc),
+            ) from exc
+
+        return ProviderUploadResult(
+            provider=self.provider_name,
+            remote_id=response.id,
+            expires_at=None,
+            raw_filename=getattr(response, "filename", path.name) or path.name,
+            size_bytes=int(getattr(response, "bytes", 0) or path.stat().st_size),
+        )
+
+    def delete(self, remote_id: str) -> None:
+        if not self.is_configured():
+            raise NotConfiguredError("xAI API key not set.")
+
+        api_key = self._settings.get_secret(SecretKey.XAI_API_KEY)
+        client = OpenAI(api_key=api_key, base_url=XAI_BASE_URL)
+
+        try:
+            client.files.delete(remote_id)
+        except OpenAIAuthError as exc:
+            raise AuthenticationError(
+                "xAI rejected the API key during delete.",
+                raw=str(exc),
+            ) from exc
+        except OpenAIAPIError as exc:
+            status = getattr(exc, "status_code", None)
+            if status == 404:
+                return  # Already gone — idempotent.
+            raise ProviderError(
+                f"xAI delete error: {getattr(exc, 'message', str(exc))}",
+                raw=str(exc),
+            ) from exc
+        except Exception as exc:
+            raise ProviderError(
+                f"Unexpected error deleting from xAI: {exc}",
                 raw=str(exc),
             ) from exc

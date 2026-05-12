@@ -24,11 +24,11 @@ from pathlib import Path
 from attachments.registry import FileRegistry
 from attachments.uploaders import (
     AnthropicUploader,
-    AzureOpenAIUploader,
     BaseUploader,
     GeminiUploader,
     OpenAIUploader,
     ProviderUploadResult,
+    XAIUploader,
 )
 from providers.base import FileRef, NotConfiguredError, ProviderError
 from settings_manager import SettingsManager
@@ -41,7 +41,7 @@ _UPLOADER_CLASSES: dict[str, type[BaseUploader]] = {
     "anthropic": AnthropicUploader,
     "gemini": GeminiUploader,
     "openai": OpenAIUploader,
-    "azure_openai": AzureOpenAIUploader,
+    "xai": XAIUploader,
 }
 
 

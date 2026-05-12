@@ -43,9 +43,10 @@ from widgets.response_card import ResponseCard
 # Same provider key mapping used by the dispatcher's orchestrator path.
 _PROVIDER_TO_LIBRARY_KEY: dict[Provider, str] = {
     Provider.OPENAI: "openai",
-    Provider.AZURE_OPENAI: "azure_openai",
     Provider.ANTHROPIC: "anthropic",
     Provider.GOOGLE: "gemini",
+    Provider.XAI: "xai",
+    # Provider.AZURE_OPENAI deliberately removed.
 }
 
 

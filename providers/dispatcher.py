@@ -67,7 +67,10 @@ from attachments.orchestrator import FileOrchestrator
 from attachments.registry import FileRegistry
 from models import Provider, get_model
 from providers.anthropic_client import AnthropicClient
-from providers.azure_openai_client import AzureOpenAIClient
+# Azure OpenAI client kept on disk as deprecated provider — not imported
+# here. See providers/azure_openai_client.py for the legacy non-streaming
+# code if Azure support is restored later.
+from providers.grok_client import GrokClient
 from providers.base import (
     BaseProviderClient,
     ChatRequest,
@@ -90,11 +93,13 @@ from providers.streaming import (
 from settings_manager import SettingsManager
 
 
-_PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
+__PROVIDER_TO_ORCHESTRATOR_KEY: dict[Provider, str] = {
     Provider.OPENAI: "openai",
-    Provider.AZURE_OPENAI: "azure_openai",
     Provider.ANTHROPIC: "anthropic",
     Provider.GOOGLE: "gemini",
+    Provider.XAI: "xai",
+    # Provider.AZURE_OPENAI deliberately removed — the Azure chip is
+    # being retired; Grok takes its slot in the comparison grid.
 }
 
 
@@ -293,9 +298,9 @@ class Dispatcher(QObject):
 
         self._clients: dict[Provider, BaseProviderClient] = {
             Provider.OPENAI: OpenAIClient(self._settings),
-            Provider.AZURE_OPENAI: AzureOpenAIClient(self._settings),
             Provider.ANTHROPIC: AnthropicClient(self._settings),
             Provider.GOOGLE: GeminiClient(self._settings),
+            Provider.XAI: GrokClient(self._settings),
         }
 
         self._registry = registry or FileRegistry()

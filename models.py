@@ -62,14 +62,15 @@ DEFAULT_MODELS: list[ModelInfo] = [
         output_cost_per_1m=1.50,
     ),
     ModelInfo(
-        id="gpt-4.1-azure",
-        label="gpt-4.1 Azure",
-        provider=Provider.AZURE_OPENAI,
-        api_model_name="gpt-4.1",
-        supports_images=True,
-        context_window=128_000,
-        input_cost_per_1m=0.15,
-        output_cost_per_1m=0.60,
+        id="grok-4.20-reasoning",
+        label="Grok 4.20",
+        provider=Provider.XAI,
+        api_model_name="grok-4.20-0309-reasoning",
+        supports_images=False,  # Phase 3 will flip this when input_image lands
+        context_window=256_000,
+        input_cost_per_1m=3.00,   # approximate — verify on console.x.ai pricing
+        output_cost_per_1m=15.00,
+        enabled=True,
     ),
     ModelInfo(
     id="gemini-3.1-pro",
