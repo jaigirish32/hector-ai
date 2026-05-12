@@ -464,6 +464,18 @@ def _build_stylesheet() -> str:
         background-color: transparent;
         border: 0;
     }}
+
+    /* Compare view's card scroll area — paint with app background
+       so on Mac the area behind cards doesn't show white when a card
+       is hidden by chip toggle. Targeted by object name so we don't
+       affect FILES panel which uses its own BG_SIDEBAR rule. */
+    QScrollArea#cardsScroll,
+    QScrollArea#cardsScroll > QWidget,
+    QWidget#cardsContainer {{
+        background-color: {c.BG_APP};
+        border: 0;
+    }}
+
     QAbstractScrollArea {{
         background-color: transparent;
     }}

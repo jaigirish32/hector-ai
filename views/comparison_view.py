@@ -121,6 +121,7 @@ class ComparisonView(QWidget):
         root.addWidget(self._prompt_area)
 
         self._cards_scroll = QScrollArea()
+        self._cards_scroll.setObjectName("cardsScroll")
         self._cards_scroll.setWidgetResizable(True)
         self._cards_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._cards_scroll.setHorizontalScrollBarPolicy(
@@ -128,6 +129,7 @@ class ComparisonView(QWidget):
         )
 
         self._cards_container = QWidget()
+        self._cards_container.setObjectName("cardsContainer")
         self._cards_grid = QGridLayout(self._cards_container)
         self._cards_grid.setContentsMargins(0, 0, 0, 0)
         self._cards_grid.setSpacing(12)
