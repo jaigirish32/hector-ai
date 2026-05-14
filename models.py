@@ -52,14 +52,14 @@ class ModelInfo:
 # ---------------------------------------------------------------------------
 DEFAULT_MODELS: list[ModelInfo] = [
     ModelInfo(
-        id="gpt-5.5",
-        label="gpt-5.5",
-        provider=Provider.OPENAI,
-        api_model_name="gpt-5.5",
-        supports_images=False,
-        context_window=16_385,
-        input_cost_per_1m=0.50,
-        output_cost_per_1m=1.50,
+    id="gpt-5.5",
+    label="gpt-5.5",
+    provider=Provider.OPENAI,
+    api_model_name="gpt-5.5",
+    supports_images=False,
+    context_window=1_050_000,   
+    input_cost_per_1m=5.00,     
+    output_cost_per_1m=30.00,   
     ),
     ModelInfo(
         id="grok-4.20-reasoning",

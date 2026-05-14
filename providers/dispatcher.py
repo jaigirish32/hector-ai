@@ -76,6 +76,7 @@ from providers.base import (
     ChatRequest,
     ChatResponse,
     FileRef,
+    HistoryMessage,
     ProviderError,
 )
 from providers._dbg import dbg
@@ -388,6 +389,7 @@ class Dispatcher(QObject):
         temperature: float = 0.7,
         max_tokens: int = 2048,
         system_prompt: str = "",
+        per_model_history: dict[str, tuple[HistoryMessage, ...]] | None = None,
     ) -> None:
         """Fan out using file_refs that the caller has already resolved."""
         if self._pending_count > 0:
@@ -442,6 +444,7 @@ class Dispatcher(QObject):
                         f"isn't natively supported here.",
                     )
 
+            history = per_model_history.get(model_id, ()) if per_model_history else ()
             request = ChatRequest(
                 prompt=prompt,
                 model=model,
@@ -449,6 +452,7 @@ class Dispatcher(QObject):
                 max_tokens=max_tokens,
                 system_prompt=system_prompt or None,
                 file_refs=refs_for_model,
+                history=history,
             )
             runnable_jobs.append((model_id, request, client, pre_caveats))
 

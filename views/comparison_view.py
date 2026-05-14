@@ -14,10 +14,14 @@ response_failed, all_complete). Each streaming signal routes to the
 matching ResponseCard method so the user sees text appear live,
 word-by-word, the way claude.ai and chatgpt.com do.
 
-For thinking providers (Gemini 2.5 Flash) stream_thinking arrives
-before any text, prompting the card to show a THINKING badge during
-the model's internal reasoning phase. When the first text chunk
-arrives, stream_started transitions the card to STREAMING.
+Feature 1.6 — Conversation history
+-----------------------------------
+Each model maintains an independent conversation thread stored in
+SQLite via ConversationStore. History is loaded per model before each
+dispatch and passed through ChatRequest.history to the provider client.
+After a successful response, the turn (user prompt + assistant text)
+is saved back to the store. Clear History is wired through
+PromptArea.clear_history_requested signal.
 """
 from __future__ import annotations
 
@@ -32,8 +36,9 @@ from PySide6.QtWidgets import (
 )
 
 from attachments.file_library import FileLibrary
+from conversation_store import ConversationStore
 from models import ModelInfo, Provider, get_model
-from providers.base import ChatResponse, FileRef
+from providers.base import ChatResponse, FileRef, HistoryMessage
 from providers.dispatcher import Dispatcher
 from widgets.file_library_panel import FileLibraryPanel
 from widgets.prompt_area import PromptArea
@@ -50,7 +55,7 @@ _PROVIDER_TO_LIBRARY_KEY: dict[Provider, str] = {
 }
 
 
-# ---------- Hardcoded chat defaults (temporary) ----------
+# ---------- Hardcoded chat defaults ----------
 
 SYSTEM_PROMPT = """You are a thoughtful, senior technical advisor.
 
@@ -100,12 +105,19 @@ class ComparisonView(QWidget):
         self._file_panel: FileLibraryPanel | None = None
         self._dispatcher = Dispatcher()
 
-        # Existing terminal-signal connections — unchanged.
+        # Conversation history store — one SQLite table in hector.db.
+        self._conversation_store = ConversationStore()
+
+        # The prompt from the most recent Run, held so _on_response_received
+        # can save user_content alongside the assistant response.
+        self._last_prompt: str = ""
+
+        # Terminal signal connections.
         self._dispatcher.response_received.connect(self._on_response_received)
         self._dispatcher.response_failed.connect(self._on_response_failed)
         self._dispatcher.all_complete.connect(self._on_all_complete)
 
-        # v0.2.0 streaming-signal connections.
+        # Streaming signal connections.
         self._dispatcher.stream_started.connect(self._on_stream_started)
         self._dispatcher.stream_thinking.connect(self._on_stream_thinking)
         self._dispatcher.stream_text_delta.connect(self._on_stream_text_delta)
@@ -118,6 +130,7 @@ class ComparisonView(QWidget):
 
         self._prompt_area = PromptArea()
         self._prompt_area.run_requested.connect(self._on_run_requested)
+        self._prompt_area.clear_history_requested.connect(self._on_clear_history)
         root.addWidget(self._prompt_area)
 
         self._cards_scroll = QScrollArea()
@@ -209,12 +222,33 @@ class ComparisonView(QWidget):
         if not models:
             return
 
-        self._lay_out_cards(models)
-        for card in self._cards.values():
-            card.set_loading()
+        self._last_prompt = prompt
 
-        # Per-model: build pre-resolved file_refs from the library, since
-        # the files were already uploaded at attach time.
+        # Load history per model BEFORE laying out cards.
+        per_model_history: dict[str, tuple[HistoryMessage, ...]] = {}
+        prior_turns: dict[str, list[tuple[str, str]]] = {}
+
+        for model in models:
+            turns = self._conversation_store.get_history(model.id)
+            prior_turns[model.id] = [
+                (t.user_content, t.assistant_content) for t in turns
+            ]
+            messages: list[HistoryMessage] = []
+            for turn in turns:
+                messages.append(HistoryMessage(role="user", content=turn.user_content))
+                messages.append(HistoryMessage(role="assistant", content=turn.assistant_content))
+            per_model_history[model.id] = tuple(messages)
+
+        self._lay_out_cards(models)
+
+        for model in models:
+            card = self._cards.get(model.id)
+            if card is not None:
+                card.set_loading(
+                    history=prior_turns.get(model.id, []),
+                    current_prompt=prompt,
+                )
+
         selected_ids: list[int] = (
             self._file_panel.selected_file_ids() if self._file_panel else []
         )
@@ -235,15 +269,23 @@ class ComparisonView(QWidget):
             attached_file_ids=selected_ids,
             system_prompt=SYSTEM_PROMPT,
             max_tokens=MAX_OUTPUT_TOKENS,
+            per_model_history=per_model_history,
         )
 
     # ---------- Dispatcher signal handlers ----------
 
     def _on_response_received(self, model_id: str, response: ChatResponse) -> None:
-        """Terminal happy path."""
+        """Terminal happy path — save turn to history then render card."""
         card = self._cards.get(model_id)
         if card is None:
             return
+
+        self._conversation_store.add_turn(
+            model_id=model_id,
+            user_content=self._last_prompt,
+            assistant_content=response.text,
+        )
+
         card.set_response(
             text=response.text,
             latency_seconds=response.latency_seconds,
@@ -253,7 +295,7 @@ class ComparisonView(QWidget):
         )
 
     def _on_response_failed(self, model_id: str, message: str) -> None:
-        """Terminal error path."""
+        """Terminal error path — do NOT save to history on failure."""
         card = self._cards.get(model_id)
         if card is None:
             return
@@ -262,58 +304,53 @@ class ComparisonView(QWidget):
     def _on_all_complete(self) -> None:
         self._maybe_award_badges()
 
-    # ---------- v0.2.0 streaming signal handlers ----------
+    # ---------- Clear history ----------
+
+    def _on_clear_history(self) -> None:
+        """Wipe all conversation history from the store. Silent."""
+        self._conversation_store.clear_all()
+
+    # ---------- Streaming signal handlers ----------
 
     def _on_stream_started(self, model_id: str, served_model: str) -> None:
-        """First text-producing event of a stream. Card transitions
-        LOADING (or THINKING for thinking providers) -> STREAMING."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.start_streaming(served_model)
 
     def _on_stream_thinking(self, model_id: str) -> None:
-        """Provider is reasoning internally before producing visible text.
-        Currently emitted only by Gemini 2.5 Flash. Card transitions
-        LOADING -> THINKING; will transition THINKING -> STREAMING when
-        first text chunk arrives via stream_started."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.start_thinking()
 
     def _on_stream_text_delta(self, model_id: str, chunk: str) -> None:
-        """A text chunk from the provider."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.append_stream_text(chunk)
 
     def _on_stream_usage(self, model_id: str, input_tokens: int, output_tokens: int) -> None:
-        """Token usage report."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.update_stream_usage(input_tokens, output_tokens)
 
     def _on_stream_cancelled(self, model_id: str) -> None:
-        """Terminal cancellation path."""
         card = self._cards.get(model_id)
         if card is None:
             return
         card.set_cancelled()
 
     def _on_cancel_requested(self, model_id: str) -> None:
-        """User clicked Stop on a card. Tell the dispatcher to cancel
-        that worker. The dispatcher will eventually emit stream_cancelled
-        which routes back to the card's set_cancelled()."""
         self._dispatcher.cancel(model_id)
 
     # ---------- Shutdown ----------
 
     def shutdown(self) -> None:
-        """Tell the dispatcher to cancel workers and clean up."""
+        """Cancel workers, close the history store, clean up."""
         self._dispatcher.shutdown()
+        self._conversation_store.close()
 
     # ---------- Badges ----------
 

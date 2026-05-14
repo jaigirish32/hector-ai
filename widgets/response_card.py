@@ -1,8 +1,9 @@
 """Response card widget — one LLM's output with metrics and actions."""
+import html as html_module
 from enum import Enum
 
 from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap, QTextCursor
+from PySide6.QtGui import QIcon, QPixmap, QTextCursor
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QFrame,
@@ -38,6 +39,7 @@ _STOP_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
 fill="#A0A0A0" stroke="none">
 <rect x="6" y="6" width="12" height="12" rx="2"/>
 </svg>"""
+
 
 def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     """Render an SVG string into a QIcon."""
@@ -174,9 +176,22 @@ blockquote {
 """
 
 
+# Teal divider rendered as a table row — QTextEdit renders tables
+# reliably unlike <hr> with CSS classes or opacity styles.
+_TURN_DIVIDER_HTML = (
+    '<table width="100%" cellspacing="0" cellpadding="0"'
+    ' style="margin: 16px 0; background-color: transparent;">'
+    '<tr><td style="border-top: 2px solid #00D4C4; padding: 0;"></td></tr>'
+    '</table>'
+)
+
+
 def _wrap_with_css(body_content: str) -> str:
     """Wrap HTML in a styled document for QTextEdit.setHtml."""
-    return f"<html><head><style>{_RESPONSE_CSS}</style></head><body>{body_content}</body></html>"
+    return (
+        f"<html><head><style>{_RESPONSE_CSS}</style></head>"
+        f"<body>{body_content}</body></html>"
+    )
 
 
 # Debounced markdown re-render interval during streaming.
@@ -225,6 +240,17 @@ class ResponseCard(QFrame):
 
         self._model = model
         self._state = CardState.EMPTY
+
+        # Cached HTML for all prior conversation turns for this model.
+        # Set in set_loading(), reused in streaming and completion so
+        # history is never wiped when the current response updates.
+        self._history_html: str = ""
+
+        # Cached HTML for the current turn's user prompt (YOU label +
+        # prompt text + ASSISTANT label). Set in set_loading(), prepended
+        # before streaming/final response so the user always sees what
+        # question produced the current answer.
+        self._current_prompt_html: str = ""
 
         self.setObjectName("card")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -315,8 +341,6 @@ class ResponseCard(QFrame):
         self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
         self._stop_icon = _svg_to_icon(_STOP_ICON_SVG, size=14)
 
-        # Stop and Copy share the same slot — only one is visible at a time.
-        # Stop appears during LOADING/THINKING/STREAMING; Copy after COMPLETE.
         self._stop_button = QPushButton()
         self._stop_button.setIcon(self._stop_icon)
         self._stop_button.setObjectName("stopButton")
@@ -376,33 +400,150 @@ class ResponseCard(QFrame):
         container.value_label = value  # type: ignore[attr-defined]
         return container
 
+    # ---------- History rendering ----------
+
+    def _build_history_html(self, history: list[tuple[str, str]]) -> str:
+        """Render prior conversation turns as stacked HTML blocks.
+
+        Each turn:
+          YOU label + user prompt box (dimmed)
+          ASSISTANT label + markdown-rendered response (dimmed)
+          Bottom separator line between turns
+
+        After all turns, a teal divider separates history from the
+        current turn. Returns empty string when history is empty.
+        """
+        if not history:
+            return ""
+
+        parts: list[str] = []
+        for user_content, assistant_content in history:
+            user_escaped = html_module.escape(user_content)
+            assistant_html = markdown.markdown(
+                assistant_content,
+                extensions=["tables", "fenced_code", "nl2br"],
+            )
+            parts.append(
+                # Outer div dims the entire prior turn visually.
+                '<div style="opacity: 0.55; margin-bottom: 16px;'
+                ' padding-bottom: 16px;'
+                ' border-bottom: 1px solid #1E1E1E;">'
+
+                # YOU label
+                '<div style="color: #5E5E5E; font-size: 10px;'
+                ' font-weight: 600; letter-spacing: 0.08em;'
+                ' margin-bottom: 4px;">YOU</div>'
+
+                # User prompt box
+                '<div style="background-color: #1A1A1A; border-radius: 6px;'
+                ' padding: 8px 12px; color: #9A9A9A; font-size: 12px;'
+                f' white-space: pre-wrap; word-break: break-word;">'
+                f'{user_escaped}</div>'
+
+                # ASSISTANT label
+                '<div style="color: #5E5E5E; font-size: 10px;'
+                ' font-weight: 600; letter-spacing: 0.08em;'
+                ' margin-top: 10px; margin-bottom: 4px;">ASSISTANT</div>'
+
+                # Assistant response
+                f'{assistant_html}'
+                '</div>'
+            )
+
+        # Teal divider after all history turns, before current turn.
+        parts.append(_TURN_DIVIDER_HTML)
+
+        return "".join(parts)
+
+    def _build_prompt_html(self, prompt: str) -> str:
+        """Render the current turn's user prompt with YOU label.
+
+        Shown at full brightness to distinguish it from dimmed history.
+        Followed by ASSISTANT label so the response flows naturally below.
+        Returns empty string when prompt is empty.
+        """
+        if not prompt:
+            return ""
+
+        user_escaped = html_module.escape(prompt)
+        return (
+            # YOU label — full brightness
+            '<div style="color: #8A8A8A; font-size: 10px;'
+            ' font-weight: 600; letter-spacing: 0.08em;'
+            ' margin-bottom: 4px;">YOU</div>'
+
+            # User prompt box — full brightness
+            '<div style="background-color: #1A1A1A; border-radius: 6px;'
+            ' padding: 8px 12px; color: #EDEDED; font-size: 12px;'
+            f' white-space: pre-wrap; word-break: break-word;">'
+            f'{user_escaped}</div>'
+
+            # ASSISTANT label
+            '<div style="color: #8A8A8A; font-size: 10px;'
+            ' font-weight: 600; letter-spacing: 0.08em;'
+            ' margin-top: 10px; margin-bottom: 4px;">ASSISTANT</div>'
+        )
+
     # ---------- Public API ----------
 
-    def set_loading(self) -> None:
-        """Card is queued for a Run, no events arrived yet."""
+    def set_loading(
+        self,
+        history: list[tuple[str, str]] | None = None,
+        current_prompt: str = "",
+    ) -> None:
+        """Card is queued for a Run, no events arrived yet.
+
+        history: prior (user_content, assistant_content) pairs for this
+        model. Rendered immediately at reduced opacity above the current
+        turn. Pass None or [] for a fresh card with no history.
+
+        current_prompt: the prompt text for this turn. Rendered at full
+        brightness below history so the user sees what question is being
+        answered before the response arrives.
+        """
         self._render_timer.stop()
         self._stream_buffer = ""
         self._state = CardState.LOADING
-        self._body.setPlaceholderText("Generating response...")
-        self._body.clear()
+
+        self._history_html = self._build_history_html(history or [])
+        self._current_prompt_html = self._build_prompt_html(current_prompt)
+
+        if self._history_html or self._current_prompt_html:
+            body_html = (
+                self._history_html
+                + self._current_prompt_html
+                + '<p style="color: #5E5E5E; font-size: 12px;'
+                ' font-style: italic; margin-top: 8px;">'
+                'Generating response...</p>'
+            )
+            self._body.setPlaceholderText("")
+            self._body.setHtml(_wrap_with_css(body_html))
+            # Scroll to bottom so the generating note is visible.
+            self._body.verticalScrollBar().setValue(
+                self._body.verticalScrollBar().maximum()
+            )
+        else:
+            # No history, no prompt — original behaviour.
+            self._body.clear()
+            self._body.setPlaceholderText("Generating response...")
+
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
         self._set_status("GENERATING", accent=False)
         self._apply_state()
 
     def start_thinking(self) -> None:
-        """Provider is reasoning internally before producing visible text.
-
-        Currently used by Gemini 2.5 Flash. Transitions LOADING → THINKING.
-        Body stays empty; badge shows THINKING. When the first text chunk
-        arrives via start_streaming, card transitions THINKING → STREAMING.
-        """
-        # No-op if we've moved past LOADING/THINKING (defensive against
-        # late events arriving after a state change).
+        """Provider is reasoning internally before producing visible text."""
         if self._state not in (CardState.LOADING, CardState.THINKING):
             return
         self._state = CardState.THINKING
-        self._body.setHtml(_wrap_with_css(""))
+        # Preserve history + current prompt, clear only the response area.
+        self._body.setHtml(
+            _wrap_with_css(self._history_html + self._current_prompt_html)
+        )
+        self._body.verticalScrollBar().setValue(
+        self._body.verticalScrollBar().maximum()
+        )
         self._body.setPlaceholderText("")
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
@@ -414,7 +555,14 @@ class ResponseCard(QFrame):
         self._state = CardState.STREAMING
         self._stream_buffer = ""
         self._render_timer.stop()
-        self._body.setHtml(_wrap_with_css(""))
+        # Preserve history + current prompt, clear only the response area.
+        self._body.setHtml(
+            _wrap_with_css(self._history_html + self._current_prompt_html)
+        )
+        self._body.verticalScrollBar().setValue(
+            self._body.verticalScrollBar().maximum()
+        )
+
         self._body.setPlaceholderText("")
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
@@ -434,7 +582,7 @@ class ResponseCard(QFrame):
             self._render_timer.start(_STREAM_RENDER_MS)
 
     def _render_stream_buffer(self) -> None:
-        """Render the streaming buffer as markdown→HTML, preserving scroll."""
+        """Render history + current prompt + streaming buffer as HTML."""
         if self._state != CardState.STREAMING:
             return
         if not self._stream_buffer:
@@ -444,11 +592,15 @@ class ResponseCard(QFrame):
         was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
         prior_position = scrollbar.value()
 
-        html = markdown.markdown(
+        current_html = markdown.markdown(
             self._stream_buffer,
             extensions=["tables", "fenced_code", "nl2br"],
         )
-        self._body.setHtml(_wrap_with_css(html))
+        self._body.setHtml(
+            _wrap_with_css(
+                self._history_html + self._current_prompt_html + current_html
+            )
+        )
 
         if was_at_bottom:
             scrollbar.setValue(scrollbar.maximum())
@@ -481,11 +633,19 @@ class ResponseCard(QFrame):
         self._render_timer.stop()
         self._state = CardState.COMPLETE
 
-        html = markdown.markdown(
+        current_html = markdown.markdown(
             text,
             extensions=["tables", "fenced_code", "nl2br"],
         )
-        self._body.setHtml(_wrap_with_css(html))
+        self._body.setHtml(
+            _wrap_with_css(
+                self._history_html + self._current_prompt_html + current_html
+            )
+        )
+
+        self._body.verticalScrollBar().setValue(
+        self._body.verticalScrollBar().maximum()
+        )
 
         self._update_metrics(
             f"{latency_seconds:.1f} s",
@@ -497,11 +657,19 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_error(self, message: str) -> None:
-        """Show error state. Overwrites any partial streamed text."""
+        """Show error state. Preserves history + prompt above the error."""
         self._render_timer.stop()
         self._state = CardState.ERROR
         error_html = f"<p>Error: {message}</p>"
-        self._body.setHtml(_wrap_with_css(error_html))
+        self._body.setHtml(
+            _wrap_with_css(
+                self._history_html + self._current_prompt_html + error_html
+            )
+        )
+        self._body.verticalScrollBar().setValue(
+        self._body.verticalScrollBar().maximum()
+        )
+
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
         self._set_status("FAILED", accent=False)
@@ -522,6 +690,8 @@ class ResponseCard(QFrame):
         """Return card to empty state."""
         self._render_timer.stop()
         self._stream_buffer = ""
+        self._history_html = ""
+        self._current_prompt_html = ""
         self._state = CardState.EMPTY
         self._body.clear()
         self._body.setPlaceholderText("Waiting for prompt...")
@@ -561,12 +731,7 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Toggle Stop and Copy buttons based on current state.
-
-        Stop is visible during active states (LOADING/THINKING/STREAMING).
-        It is disabled once clicked (CANCELLING) to prevent double-clicks.
-        Copy is visible only after successful completion.
-        """
+        """Toggle Stop and Copy buttons based on current state."""
         active_states = (
             CardState.LOADING,
             CardState.THINKING,
@@ -593,11 +758,9 @@ class ResponseCard(QFrame):
         self._body.setTextCursor(cursor)
         self._copy_button.setIcon(self._copy_icon_done)
         QTimer.singleShot(1500, self._revert_copy_icon)
-    
+
     def _on_stop(self) -> None:
-        """User clicked Stop. Move to CANCELLING (button greys out),
-        emit signal so ComparisonView can call dispatcher.cancel.
-        Card will move to CANCELLED when StreamCancelled arrives."""
+        """User clicked Stop."""
         if self._state not in (
             CardState.LOADING,
             CardState.THINKING,

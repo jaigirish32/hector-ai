@@ -2,8 +2,7 @@
 The prompt area — top of the Compare view.
 
 Contains: a multi-line prompt text box, model selection chips
-(loaded from the central registry), run parameters, and the
-"Run comparison" button.
+(loaded from the central registry), and action buttons.
 
 Files are managed in the sidebar's FILES section, not here.
 """
@@ -26,6 +25,9 @@ class PromptArea(QFrame):
 
     # User clicked Run — payload = (prompt_text, [selected_model_ids])
     run_requested = Signal(str, list)
+
+    # User clicked Clear History
+    clear_history_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -60,10 +62,7 @@ class PromptArea(QFrame):
         self._prompt_input.textChanged.connect(self._update_char_counter)
         root.addWidget(self._prompt_input)
 
-        # File-format helper note. Sits between the prompt and the models
-        # row so it reads as guidance about the attached file, not about
-        # the prompt. Red + italic to signal a constraint, but small font
-        # to keep visual weight low — it's a note, not a warning.
+        # File-format helper note.
         pdf_only_note = QLabel(
             "Please note that all files that are attached should be in PDF format."
         )
@@ -102,12 +101,16 @@ class PromptArea(QFrame):
         root.addWidget(separator)
 
         bottom_row = QHBoxLayout()
-        params_label = QLabel(
-            "Temp <b>0.7</b>    ·    Max tokens <b>2048</b>    ·    Stream <b>ON</b>"
+
+        # Clear History — same styling as Run button.
+        self._clear_history_button = QPushButton("Clear History")
+        self._clear_history_button.setObjectName("primary")
+        self._clear_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_history_button.setToolTip(
+            "Delete all stored conversation history for all models"
         )
-        params_label.setObjectName("hintText")
-        params_label.setTextFormat(Qt.TextFormat.RichText)
-        bottom_row.addWidget(params_label)
+        self._clear_history_button.clicked.connect(self._on_clear_history_clicked)
+        bottom_row.addWidget(self._clear_history_button)
 
         bottom_row.addStretch()
 
@@ -116,6 +119,7 @@ class PromptArea(QFrame):
         self._run_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self._run_button.clicked.connect(self._on_run_clicked)
         bottom_row.addWidget(self._run_button)
+
         root.addLayout(bottom_row)
         self._update_run_button_state()
 
@@ -150,3 +154,6 @@ class PromptArea(QFrame):
         if not prompt or not models:
             return
         self.run_requested.emit(prompt, models)
+
+    def _on_clear_history_clicked(self) -> None:
+        self.clear_history_requested.emit()

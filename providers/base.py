@@ -44,6 +44,15 @@ class FileRef:
     filename: str
     mime_type: str
 
+@dataclass(frozen=True)
+class HistoryMessage:
+    """One turn of conversation history passed to a provider.
+
+    role is either 'user' or 'assistant'. Built from ConversationStore
+    turns before dispatch and passed in ChatRequest.history.
+    """
+    role: str      # 'user' or 'assistant'
+    content: str
 
 @dataclass(frozen=True)
 class ChatRequest:
@@ -62,6 +71,7 @@ class ChatRequest:
     system_prompt: str | None = None
     file_paths: tuple[Path, ...] = ()
     file_refs: tuple[FileRef, ...] = ()
+    history: tuple[HistoryMessage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -89,6 +99,7 @@ class ChatResponse:
     cost_usd: float
     served_model: str  # exactly what the API reported it served us with
     caveats: tuple[str, ...] = field(default_factory=tuple)
+    cached_input_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +249,16 @@ def calculate_cost_usd(
     model: ModelInfo,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
 ) -> float:
-    """Return the USD cost for a completion given token counts."""
-    input_cost = (input_tokens / 1_000_000) * model.input_cost_per_1m
+    """Return the USD cost for a completion given token counts.
+
+    cached_input_tokens: subset of input_tokens that hit the prompt
+    cache and are billed at 90% discount (input_cost_per_1m × 0.1).
+    Only OpenAI reports this currently; other providers pass 0.
+    """
+    uncached_input = input_tokens - cached_input_tokens
+    input_cost = (uncached_input / 1_000_000) * model.input_cost_per_1m
+    cached_cost = (cached_input_tokens / 1_000_000) * model.input_cost_per_1m * 0.1
     output_cost = (output_tokens / 1_000_000) * model.output_cost_per_1m
-    return input_cost + output_cost
+    return input_cost + cached_cost + output_cost
