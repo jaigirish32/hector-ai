@@ -21,7 +21,7 @@ import markdown
 from models import ModelInfo, Provider
 
 
-# Inline SVG icons for the copy button.
+# Inline SVG icons.
 _COPY_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
 fill="none" stroke="#A0A0A0" stroke-width="2" stroke-linecap="round"
 stroke-linejoin="round">
@@ -40,6 +40,16 @@ fill="#A0A0A0" stroke="none">
 <rect x="6" y="6" width="12" height="12" rx="2"/>
 </svg>"""
 
+_TRASH_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+fill="none" stroke="#A0A0A0" stroke-width="2" stroke-linecap="round"
+stroke-linejoin="round">
+<polyline points="3 6 5 6 21 6"/>
+<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+<path d="M10 11v6"/>
+<path d="M14 11v6"/>
+<path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+</svg>"""
+
 
 def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     """Render an SVG string into a QIcon."""
@@ -53,7 +63,7 @@ def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     return QIcon(pixmap)
 
 
-# CSS for response body — applied via setHtml in streaming and completion.
+# CSS for response body.
 _RESPONSE_CSS = """
 body {
     font-family: 'Segoe UI', 'SF Pro Display', 'Inter', 'Helvetica Neue', sans-serif;
@@ -175,9 +185,7 @@ blockquote {
 }
 """
 
-
-# Teal divider rendered as a table row — QTextEdit renders tables
-# reliably unlike <hr> with CSS classes or opacity styles.
+# Teal divider rendered as a table row.
 _TURN_DIVIDER_HTML = (
     '<table width="100%" cellspacing="0" cellpadding="0"'
     ' style="margin: 16px 0; background-color: transparent;">'
@@ -199,15 +207,6 @@ _STREAM_RENDER_MS = 250
 
 
 class CardState(str, Enum):
-    """Card lifecycle states.
-
-    Typical paths:
-      EMPTY → LOADING → STREAMING → COMPLETE
-      EMPTY → LOADING → THINKING → STREAMING → COMPLETE  (Gemini, Anthropic)
-      Any active state → CANCELLING → CANCELLED  (user clicked Stop)
-      Any → ERROR
-    """
-
     EMPTY = "empty"
     LOADING = "loading"
     THINKING = "thinking"
@@ -218,7 +217,6 @@ class CardState(str, Enum):
     CANCELLED = "cancelled"
 
 
-# Provider accent colors for the initial-letter badge.
 PROVIDER_COLORS = {
     Provider.OPENAI:       ("#0F2E20", "#10A37F"),
     Provider.AZURE_OPENAI: ("#0F1E35", "#4A90E2"),
@@ -234,22 +232,16 @@ class ResponseCard(QFrame):
 
     regenerate_requested = Signal(str)
     cancel_requested = Signal(str)
+    # Emitted when user clicks the per-card Clear History button.
+    # Carries model_id so ComparisonView can route to the right store entry.
+    clear_history_requested = Signal(str)
 
     def __init__(self, model: ModelInfo) -> None:
         super().__init__()
 
         self._model = model
         self._state = CardState.EMPTY
-
-        # Cached HTML for all prior conversation turns for this model.
-        # Set in set_loading(), reused in streaming and completion so
-        # history is never wiped when the current response updates.
         self._history_html: str = ""
-
-        # Cached HTML for the current turn's user prompt (YOU label +
-        # prompt text + ASSISTANT label). Set in set_loading(), prepended
-        # before streaming/final response so the user always sees what
-        # question produced the current answer.
         self._current_prompt_html: str = ""
 
         self.setObjectName("card")
@@ -259,11 +251,9 @@ class ResponseCard(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header
         self._header = self._build_header()
         root.addWidget(self._header)
 
-        # Body
         self._body = QTextEdit()
         self._body.setObjectName("responseBody")
         self._body.setReadOnly(True)
@@ -271,7 +261,6 @@ class ResponseCard(QFrame):
         self._body.setPlaceholderText("Waiting for prompt...")
         root.addWidget(self._body, stretch=1)
 
-        # Caveats label (italic grey, hidden by default)
         self._caveats_label = QLabel("")
         self._caveats_label.setObjectName("cardCaveat")
         self._caveats_label.setWordWrap(True)
@@ -282,11 +271,9 @@ class ResponseCard(QFrame):
         self._caveats_label.setVisible(False)
         root.addWidget(self._caveats_label)
 
-        # Footer (metrics)
         self._footer = self._build_footer()
         root.addWidget(self._footer)
 
-        # Streaming render state — debounced re-render of accumulating text.
         self._stream_buffer = ""
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -297,7 +284,6 @@ class ResponseCard(QFrame):
     # ---------- Building blocks ----------
 
     def _build_header(self) -> QWidget:
-        """Provider initial + model label + status badge + copy button."""
         header = QFrame()
         header.setObjectName("cardHeader")
 
@@ -340,6 +326,7 @@ class ResponseCard(QFrame):
         self._copy_icon_default = _svg_to_icon(_COPY_ICON_SVG, size=16)
         self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
         self._stop_icon = _svg_to_icon(_STOP_ICON_SVG, size=14)
+        self._trash_icon = _svg_to_icon(_TRASH_ICON_SVG, size=14)
 
         self._stop_button = QPushButton()
         self._stop_button.setIcon(self._stop_icon)
@@ -350,6 +337,17 @@ class ResponseCard(QFrame):
         self._stop_button.clicked.connect(self._on_stop)
         self._stop_button.setVisible(False)
         layout.addWidget(self._stop_button)
+
+        # Clear History button — trash icon, same size as copy/stop.
+        # Visible when not actively generating, hidden during active states.
+        self._clear_history_button = QPushButton()
+        self._clear_history_button.setIcon(self._trash_icon)
+        self._clear_history_button.setObjectName("copyButton")
+        self._clear_history_button.setFixedSize(32, 28)
+        self._clear_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_history_button.setToolTip("Clear conversation history for this model")
+        self._clear_history_button.clicked.connect(self._on_clear_history)
+        layout.addWidget(self._clear_history_button)
 
         self._copy_button = QPushButton()
         self._copy_button.setIcon(self._copy_icon_default)
@@ -363,7 +361,6 @@ class ResponseCard(QFrame):
         return header
 
     def _build_footer(self) -> QWidget:
-        """Latency / tokens / cost metrics."""
         footer = QFrame()
         footer.setObjectName("cardFooter")
 
@@ -383,7 +380,6 @@ class ResponseCard(QFrame):
         return footer
 
     def _make_metric(self, label_text: str, value_text: str) -> QWidget:
-        """Label-over-value column for footer metrics."""
         container = QWidget()
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -403,16 +399,6 @@ class ResponseCard(QFrame):
     # ---------- History rendering ----------
 
     def _build_history_html(self, history: list[tuple[str, str]]) -> str:
-        """Render prior conversation turns as stacked HTML blocks.
-
-        Each turn:
-          YOU label + user prompt box (dimmed)
-          ASSISTANT label + markdown-rendered response (dimmed)
-          Bottom separator line between turns
-
-        After all turns, a teal divider separates history from the
-        current turn. Returns empty string when history is empty.
-        """
         if not history:
             return ""
 
@@ -424,61 +410,39 @@ class ResponseCard(QFrame):
                 extensions=["tables", "fenced_code", "nl2br"],
             )
             parts.append(
-                # Outer div dims the entire prior turn visually.
                 '<div style="opacity: 0.55; margin-bottom: 16px;'
                 ' padding-bottom: 16px;'
                 ' border-bottom: 1px solid #1E1E1E;">'
-
-                # YOU label
                 '<div style="color: #5E5E5E; font-size: 10px;'
                 ' font-weight: 600; letter-spacing: 0.08em;'
                 ' margin-bottom: 4px;">YOU</div>'
-
-                # User prompt box
                 '<div style="background-color: #1A1A1A; border-radius: 6px;'
                 ' padding: 8px 12px; color: #9A9A9A; font-size: 12px;'
                 f' white-space: pre-wrap; word-break: break-word;">'
                 f'{user_escaped}</div>'
-
-                # ASSISTANT label
                 '<div style="color: #5E5E5E; font-size: 10px;'
                 ' font-weight: 600; letter-spacing: 0.08em;'
                 ' margin-top: 10px; margin-bottom: 4px;">ASSISTANT</div>'
-
-                # Assistant response
                 f'{assistant_html}'
                 '</div>'
             )
 
-        # Teal divider after all history turns, before current turn.
         parts.append(_TURN_DIVIDER_HTML)
-
         return "".join(parts)
 
     def _build_prompt_html(self, prompt: str) -> str:
-        """Render the current turn's user prompt with YOU label.
-
-        Shown at full brightness to distinguish it from dimmed history.
-        Followed by ASSISTANT label so the response flows naturally below.
-        Returns empty string when prompt is empty.
-        """
         if not prompt:
             return ""
 
         user_escaped = html_module.escape(prompt)
         return (
-            # YOU label — full brightness
             '<div style="color: #8A8A8A; font-size: 10px;'
             ' font-weight: 600; letter-spacing: 0.08em;'
             ' margin-bottom: 4px;">YOU</div>'
-
-            # User prompt box — full brightness
             '<div style="background-color: #1A1A1A; border-radius: 6px;'
             ' padding: 8px 12px; color: #EDEDED; font-size: 12px;'
             f' white-space: pre-wrap; word-break: break-word;">'
             f'{user_escaped}</div>'
-
-            # ASSISTANT label
             '<div style="color: #8A8A8A; font-size: 10px;'
             ' font-weight: 600; letter-spacing: 0.08em;'
             ' margin-top: 10px; margin-bottom: 4px;">ASSISTANT</div>'
@@ -491,16 +455,6 @@ class ResponseCard(QFrame):
         history: list[tuple[str, str]] | None = None,
         current_prompt: str = "",
     ) -> None:
-        """Card is queued for a Run, no events arrived yet.
-
-        history: prior (user_content, assistant_content) pairs for this
-        model. Rendered immediately at reduced opacity above the current
-        turn. Pass None or [] for a fresh card with no history.
-
-        current_prompt: the prompt text for this turn. Rendered at full
-        brightness below history so the user sees what question is being
-        answered before the response arrives.
-        """
         self._render_timer.stop()
         self._stream_buffer = ""
         self._state = CardState.LOADING
@@ -518,12 +472,10 @@ class ResponseCard(QFrame):
             )
             self._body.setPlaceholderText("")
             self._body.setHtml(_wrap_with_css(body_html))
-            # Scroll to bottom so the generating note is visible.
             self._body.verticalScrollBar().setValue(
                 self._body.verticalScrollBar().maximum()
             )
         else:
-            # No history, no prompt — original behaviour.
             self._body.clear()
             self._body.setPlaceholderText("Generating response...")
 
@@ -533,16 +485,14 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def start_thinking(self) -> None:
-        """Provider is reasoning internally before producing visible text."""
         if self._state not in (CardState.LOADING, CardState.THINKING):
             return
         self._state = CardState.THINKING
-        # Preserve history + current prompt, clear only the response area.
         self._body.setHtml(
             _wrap_with_css(self._history_html + self._current_prompt_html)
         )
         self._body.verticalScrollBar().setValue(
-        self._body.verticalScrollBar().maximum()
+            self._body.verticalScrollBar().maximum()
         )
         self._body.setPlaceholderText("")
         self._update_metrics("—", "—", "—")
@@ -551,18 +501,15 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def start_streaming(self, model_name: str) -> None:
-        """Stream is emitting visible text. Resets buffer + render timer."""
         self._state = CardState.STREAMING
         self._stream_buffer = ""
         self._render_timer.stop()
-        # Preserve history + current prompt, clear only the response area.
         self._body.setHtml(
             _wrap_with_css(self._history_html + self._current_prompt_html)
         )
         self._body.verticalScrollBar().setValue(
             self._body.verticalScrollBar().maximum()
         )
-
         self._body.setPlaceholderText("")
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
@@ -570,19 +517,15 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def append_stream_text(self, chunk: str) -> None:
-        """Buffer a chunk and start the debounced render timer."""
         if self._state != CardState.STREAMING:
             return
         if not chunk:
             return
-
         self._stream_buffer += chunk
-
         if not self._render_timer.isActive():
             self._render_timer.start(_STREAM_RENDER_MS)
 
     def _render_stream_buffer(self) -> None:
-        """Render history + current prompt + streaming buffer as HTML."""
         if self._state != CardState.STREAMING:
             return
         if not self._stream_buffer:
@@ -608,7 +551,6 @@ class ResponseCard(QFrame):
             scrollbar.setValue(prior_position)
 
     def update_stream_usage(self, input_tokens: int, output_tokens: int) -> None:
-        """Update token counter mid-stream."""
         if self._state != CardState.STREAMING:
             return
         total = input_tokens + output_tokens
@@ -622,12 +564,6 @@ class ResponseCard(QFrame):
         cost_usd: float,
         caveats: tuple[str, ...] = (),
     ) -> None:
-        """Final authoritative render at completion.
-
-        Race guard: if the user clicked Stop and we're CANCELLING/CANCELLED,
-        a late-arriving completion event must not flip the card back to
-        COMPLETE. The cancel wins.
-        """
         if self._state in (CardState.CANCELLING, CardState.CANCELLED):
             return
         self._render_timer.stop()
@@ -642,11 +578,9 @@ class ResponseCard(QFrame):
                 self._history_html + self._current_prompt_html + current_html
             )
         )
-
         self._body.verticalScrollBar().setValue(
-        self._body.verticalScrollBar().maximum()
+            self._body.verticalScrollBar().maximum()
         )
-
         self._update_metrics(
             f"{latency_seconds:.1f} s",
             f"{tokens}",
@@ -657,7 +591,6 @@ class ResponseCard(QFrame):
         self._apply_state()
 
     def set_error(self, message: str) -> None:
-        """Show error state. Preserves history + prompt above the error."""
         self._render_timer.stop()
         self._state = CardState.ERROR
         error_html = f"<p>Error: {message}</p>"
@@ -667,27 +600,23 @@ class ResponseCard(QFrame):
             )
         )
         self._body.verticalScrollBar().setValue(
-        self._body.verticalScrollBar().maximum()
+            self._body.verticalScrollBar().maximum()
         )
-
         self._update_metrics("—", "—", "—")
         self._set_caveats(())
         self._set_status("FAILED", accent=False)
         self._apply_state()
 
     def set_cancelled(self) -> None:
-        """Dispatcher confirmed cancellation. Preserves whatever was rendered."""
         self._render_timer.stop()
         self._state = CardState.CANCELLED
         self._set_status("STOPPED", accent=False)
         self._apply_state()
 
     def set_badge(self, text: str, accent: bool = True) -> None:
-        """Show 'FASTEST' / 'CHEAPEST' winner badge."""
         self._set_status(text, accent=accent)
 
     def reset(self) -> None:
-        """Return card to empty state."""
         self._render_timer.stop()
         self._stream_buffer = ""
         self._history_html = ""
@@ -731,7 +660,12 @@ class ResponseCard(QFrame):
         self._status_badge.setVisible(True)
 
     def _apply_state(self) -> None:
-        """Toggle Stop and Copy buttons based on current state."""
+        """Toggle buttons based on current state.
+
+        Stop   — visible during active generation.
+        Trash  — visible when not actively generating (idle, complete, error).
+        Copy   — visible when not actively generating; enabled only on COMPLETE.
+        """
         active_states = (
             CardState.LOADING,
             CardState.THINKING,
@@ -744,11 +678,16 @@ class ResponseCard(QFrame):
         self._stop_button.setVisible(is_active or is_cancelling)
         self._stop_button.setEnabled(is_active)
 
-        self._copy_button.setVisible(not (is_active or is_cancelling))
+        # Trash and Copy share the same visibility rule — hidden during
+        # active generation, visible at all other times.
+        not_generating = not (is_active or is_cancelling)
+        self._clear_history_button.setVisible(not_generating)
+        self._clear_history_button.setEnabled(not_generating)
+
+        self._copy_button.setVisible(not_generating)
         self._copy_button.setEnabled(is_complete)
 
     def _on_copy(self) -> None:
-        """Rich-text copy — preserves HTML format for Word/Outlook paste."""
         if not self._body.toPlainText():
             return
         self._body.selectAll()
@@ -760,7 +699,6 @@ class ResponseCard(QFrame):
         QTimer.singleShot(1500, self._revert_copy_icon)
 
     def _on_stop(self) -> None:
-        """User clicked Stop."""
         if self._state not in (
             CardState.LOADING,
             CardState.THINKING,
@@ -771,6 +709,12 @@ class ResponseCard(QFrame):
         self._set_status("STOPPING", accent=False)
         self._apply_state()
         self.cancel_requested.emit(self._model.id)
+
+    def _on_clear_history(self) -> None:
+        """User clicked the trash icon — emit signal with model_id.
+        ComparisonView handles the actual store deletion and UI reset.
+        """
+        self.clear_history_requested.emit(self._model.id)
 
     def _revert_copy_icon(self) -> None:
         self._copy_button.setIcon(self._copy_icon_default)

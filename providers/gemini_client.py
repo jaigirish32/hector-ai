@@ -412,18 +412,50 @@ class GeminiClient(BaseProviderClient):
     # ---------- Internal helpers ----------
 
     def _build_contents(self, request: ChatRequest) -> list:
-        """Build Gemini contents list — files first (Part.from_uri), then prompt."""
-        parts: list = []
+        """Build Gemini contents list for multi-turn conversation.
 
+        History turns are wrapped in Content objects with explicit roles.
+        Gemini uses 'model' for the assistant role, not 'assistant'.
+
+        Structure:
+        [Content(role=user, parts=[prior prompt]),
+        Content(role=model, parts=[prior response]),
+        ...
+        Content(role=user, parts=[files..., current prompt])]
+
+        Files go in the final user Content only — they were part of the
+        original turn at send time and are not re-sent with history.
+        """
+        contents: list = []
+
+        # History turns — alternating user/model Content objects.
+        for turn in request.history:
+            gemini_role = "model" if turn.role == "assistant" else "user"
+            contents.append(
+                genai_types.Content(
+                    role=gemini_role,
+                    parts=[genai_types.Part(text=turn.content)],
+                )
+            )
+
+        # Current turn — files first, then prompt text.
+        current_parts: list = []
         for ref in request.file_refs:
             if ref.provider != "gemini":
                 continue
-            parts.append(
+            current_parts.append(
                 genai_types.Part.from_uri(
                     file_uri=ref.remote_id,
                     mime_type=ref.mime_type,
                 )
             )
+        current_parts.append(genai_types.Part(text=request.prompt))
 
-        parts.append(request.prompt)
-        return parts
+        contents.append(
+            genai_types.Content(
+                role="user",
+                parts=current_parts,
+            )
+        )
+
+        return contents

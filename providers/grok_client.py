@@ -416,38 +416,46 @@ class GrokClient(BaseProviderClient):
 
     # ---------- Internal helpers ----------
 
-    def _build_input(self, request: ChatRequest) -> list[dict]:
+    def _build_input(self, request: ChatRequest) -> list[dict] | str:
         """Build the Responses API input list.
 
-        Phase 1: PDF-only file support. Each xai-provider FileRef becomes
-        an {input_file, file_id} block ahead of the user's prompt text.
-        Files first, prompt last — empirically models follow context
-        better when files appear before the question. Same convention
-        as openai_client.py.
+        Message ordering:
+        1. File blocks as separate user message (stable prefix for caching)
+        2. History turns (alternating user/assistant)
+        3. Current prompt (last)
 
-        If no files are attached, returns the prompt as a plain string,
-        which the SDK accepts directly. This keeps the no-files case
-        simple and matches xAI's quickstart examples.
+        If no files and no history, returns prompt as plain string —
+        xAI's quickstart accepts both forms and this keeps simple cases simple.
         """
         xai_refs = [r for r in request.file_refs if r.provider == "xai"]
 
-        if not xai_refs:
-            # No files — pass prompt as a plain string. SDK accepts both
-            # a string and a structured input list.
+        # Simple case: no files, no history — plain string.
+        if not xai_refs and not request.history:
             return request.prompt
 
-        content_blocks: list[dict] = []
-        for ref in xai_refs:
-            content_blocks.append({
-                "type": "input_file",
-                "file_id": ref.remote_id,
+        messages: list[dict] = []
+
+        # 1. Files first as standalone user message (cache-friendly prefix).
+        if xai_refs:
+            file_blocks: list[dict] = []
+            for ref in xai_refs:
+                file_blocks.append({
+                    "type": "input_file",
+                    "file_id": ref.remote_id,
+                })
+            messages.append({"role": "user", "content": file_blocks})
+
+        # 2. History turns.
+        for turn in request.history:
+            messages.append({
+                "role": turn.role,
+                "content": turn.content,
             })
-        content_blocks.append({
-            "type": "input_text",
-            "text": request.prompt,
+
+        # 3. Current prompt last.
+        messages.append({
+            "role": "user",
+            "content": [{"type": "input_text", "text": request.prompt}],
         })
 
-        return [{
-            "role": "user",
-            "content": content_blocks,
-        }]
+        return messages

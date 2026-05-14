@@ -211,14 +211,26 @@ class AnthropicClient(BaseProviderClient):
         if request.file_refs:
             beta_headers.append(ANTHROPIC_EXTENDED_CACHE_BETA)
 
+        # Build message list: history turns first, then current user turn.
+        # Anthropic requires strict user/assistant alternation — our
+        # ConversationStore already preserves that order.
+        messages: list[dict] = []
+        for turn in request.history:
+            messages.append({
+                "role": turn.role,
+                "content": turn.content,
+            })
+        messages.append({
+            "role": "user",
+            "content": self._build_user_content(request),
+        })
+
         # Build kwargs. When thinking is enabled, we MUST drop temperature
         # (Anthropic rejects custom temperature with thinking enabled).
         # When thinking is disabled, temperature is sent as normal.
         create_kwargs: dict = {
             "model": api_model,
-            "messages": [
-                {"role": "user", "content": self._build_user_content(request)},
-            ],
+            "messages": messages,
             "max_tokens": request.max_tokens,
             "extra_headers": {"anthropic-beta": ",".join(beta_headers)},
         }
@@ -329,11 +341,6 @@ class AnthropicClient(BaseProviderClient):
                     served_model = (
                         getattr(event.message, "model", None) or api_model
                     )
-                    # Don't yield StreamStarted yet — wait for first text
-                    # block. For thinking responses we yield StreamThinking
-                    # first; for non-thinking responses StreamStarted will
-                    # fire on RawContentBlockStartEvent(text) which arrives
-                    # almost immediately.
 
                 elif isinstance(event, RawContentBlockStartEvent):
                     content_block = getattr(event, "content_block", None)
@@ -342,12 +349,10 @@ class AnthropicClient(BaseProviderClient):
                     dbg("CLIENT", f"anthropic: content block start type={block_type}")
 
                     if block_type == "thinking" and not thinking_emitted:
-                        # Reasoning is about to begin. Flip card to THINKING.
                         dbg("CLIENT", "anthropic: yielding StreamThinking")
                         yield StreamThinking()
                         thinking_emitted = True
                     elif block_type == "text" and not streaming_emitted:
-                        # First visible text block. Flip card to STREAMING.
                         dbg("CLIENT", "anthropic: yielding StreamStarted")
                         yield StreamStarted(model=served_model)
                         streaming_emitted = True
@@ -357,9 +362,6 @@ class AnthropicClient(BaseProviderClient):
                     if delta is None:
                         continue
 
-                    # text_delta: delta.text — yield TextDelta
-                    # thinking_delta: delta.thinking — log only, never to UI
-                    # tool_use deltas: input_json_delta etc — silently consumed
                     text = getattr(delta, "text", None)
                     if text:
                         dbg("CLIENT", f"anthropic: yielding TextDelta len={len(text)}")
@@ -368,15 +370,8 @@ class AnthropicClient(BaseProviderClient):
 
                     thinking_text = getattr(delta, "thinking", None)
                     if thinking_text:
-                        # Log thinking content for diagnostics; do not
-                        # surface to the UI. Truncated preview keeps the
-                        # log readable for long reasoning passes.
                         preview = thinking_text[:80].replace("\n", " ")
                         dbg("CLIENT", f"anthropic thinking: {preview}...")
-
-                # Other events (RawContentBlockStopEvent, RawMessageDeltaEvent,
-                # RawMessageStopEvent) silently consumed — final_message
-                # accumulator handles them via the SDK.
 
         except AnthropicRateLimitError as exc:
             yield StreamFailed(
@@ -411,7 +406,7 @@ class AnthropicClient(BaseProviderClient):
 
         # Defensive: if we never saw a text block (extremely unusual),
         # emit StreamStarted now so the card transitions out of THINKING
-        # before completion. Without this the card would stay stuck.
+        # before completion.
         if not streaming_emitted:
             dbg("CLIENT", "anthropic: no text block seen, yielding StreamStarted defensively")
             yield StreamStarted(model=served_model)
@@ -428,10 +423,8 @@ class AnthropicClient(BaseProviderClient):
             )
             return
 
-        # Extract text from text blocks only. Thinking blocks have a
-        # 'thinking' attribute, not 'text', so they are naturally excluded
-        # here. Tool-use blocks have other shapes; the hasattr check
-        # tolerates them.
+        # Extract text from text blocks only. Thinking blocks and
+        # tool-use blocks are naturally excluded by the hasattr check.
         text_parts: list[str] = []
         for block in final_message.content or []:
             if hasattr(block, "text") and block.text:

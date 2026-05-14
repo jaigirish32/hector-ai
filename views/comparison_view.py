@@ -2,26 +2,18 @@
 The Compare view — workspace where users run prompts against multiple LLMs
 side by side.
 
-Reads selected files from the sidebar's FileLibraryPanel and dispatches
-real parallel API calls via the Dispatcher.
-
-v0.2.0 streaming
-----------------
-Connects to the dispatcher's streaming signals (stream_started,
-stream_thinking, stream_text_delta, stream_usage, stream_cancelled)
-in addition to the existing terminal signals (response_received,
-response_failed, all_complete). Each streaming signal routes to the
-matching ResponseCard method so the user sees text appear live,
-word-by-word, the way claude.ai and chatgpt.com do.
-
 Feature 1.6 — Conversation history
 -----------------------------------
 Each model maintains an independent conversation thread stored in
 SQLite via ConversationStore. History is loaded per model before each
 dispatch and passed through ChatRequest.history to the provider client.
 After a successful response, the turn (user prompt + assistant text)
-is saved back to the store. Clear History is wired through
-PromptArea.clear_history_requested signal.
+is saved back to the store.
+
+Clear History is per-model — each ResponseCard has a trash icon button
+that emits clear_history_requested(model_id). ComparisonView handles
+it by deleting only that model's history from the store and resetting
+the card's display.
 """
 from __future__ import annotations
 
@@ -45,17 +37,12 @@ from widgets.prompt_area import PromptArea
 from widgets.response_card import ResponseCard
 
 
-# Same provider key mapping used by the dispatcher's orchestrator path.
 _PROVIDER_TO_LIBRARY_KEY: dict[Provider, str] = {
     Provider.OPENAI: "openai",
     Provider.ANTHROPIC: "anthropic",
     Provider.GOOGLE: "gemini",
     Provider.XAI: "xai",
-    # Provider.AZURE_OPENAI deliberately removed.
 }
-
-
-# ---------- Hardcoded chat defaults ----------
 
 SYSTEM_PROMPT = """You are a thoughtful, senior technical advisor.
 
@@ -104,20 +91,12 @@ class ComparisonView(QWidget):
         self._file_library = file_library
         self._file_panel: FileLibraryPanel | None = None
         self._dispatcher = Dispatcher()
-
-        # Conversation history store — one SQLite table in hector.db.
         self._conversation_store = ConversationStore()
-
-        # The prompt from the most recent Run, held so _on_response_received
-        # can save user_content alongside the assistant response.
         self._last_prompt: str = ""
 
-        # Terminal signal connections.
         self._dispatcher.response_received.connect(self._on_response_received)
         self._dispatcher.response_failed.connect(self._on_response_failed)
         self._dispatcher.all_complete.connect(self._on_all_complete)
-
-        # Streaming signal connections.
         self._dispatcher.stream_started.connect(self._on_stream_started)
         self._dispatcher.stream_thinking.connect(self._on_stream_thinking)
         self._dispatcher.stream_text_delta.connect(self._on_stream_text_delta)
@@ -130,7 +109,6 @@ class ComparisonView(QWidget):
 
         self._prompt_area = PromptArea()
         self._prompt_area.run_requested.connect(self._on_run_requested)
-        self._prompt_area.clear_history_requested.connect(self._on_clear_history)
         root.addWidget(self._prompt_area)
 
         self._cards_scroll = QScrollArea()
@@ -156,7 +134,6 @@ class ComparisonView(QWidget):
     # ---------- Setup wiring ----------
 
     def set_file_panel(self, panel: FileLibraryPanel) -> None:
-        """Inject the sidebar's file panel so we can read its selection at Run time."""
         self._file_panel = panel
 
     # ---------- UI helpers ----------
@@ -201,6 +178,7 @@ class ComparisonView(QWidget):
         for index, model in enumerate(models):
             card = ResponseCard(model)
             card.cancel_requested.connect(self._on_cancel_requested)
+            card.clear_history_requested.connect(self._on_clear_model_history)
             self._cards[model.id] = card
 
             row = index // 2
@@ -212,19 +190,13 @@ class ComparisonView(QWidget):
 
     # ---------- Run dispatch ----------
 
-    def _on_run_requested(
-        self,
-        prompt: str,
-        model_ids: list,
-    ) -> None:
-        """User clicked Run — fan out to selected models with checked files."""
+    def _on_run_requested(self, prompt: str, model_ids: list) -> None:
         models = [m for m_id in model_ids if (m := get_model(m_id)) is not None]
         if not models:
             return
 
         self._last_prompt = prompt
 
-        # Load history per model BEFORE laying out cards.
         per_model_history: dict[str, tuple[HistoryMessage, ...]] = {}
         prior_turns: dict[str, list[tuple[str, str]]] = {}
 
@@ -275,17 +247,14 @@ class ComparisonView(QWidget):
     # ---------- Dispatcher signal handlers ----------
 
     def _on_response_received(self, model_id: str, response: ChatResponse) -> None:
-        """Terminal happy path — save turn to history then render card."""
         card = self._cards.get(model_id)
         if card is None:
             return
-
         self._conversation_store.add_turn(
             model_id=model_id,
             user_content=self._last_prompt,
             assistant_content=response.text,
         )
-
         card.set_response(
             text=response.text,
             latency_seconds=response.latency_seconds,
@@ -295,7 +264,6 @@ class ComparisonView(QWidget):
         )
 
     def _on_response_failed(self, model_id: str, message: str) -> None:
-        """Terminal error path — do NOT save to history on failure."""
         card = self._cards.get(model_id)
         if card is None:
             return
@@ -304,11 +272,14 @@ class ComparisonView(QWidget):
     def _on_all_complete(self) -> None:
         self._maybe_award_badges()
 
-    # ---------- Clear history ----------
+    # ---------- Per-model clear history ----------
 
-    def _on_clear_history(self) -> None:
-        """Wipe all conversation history from the store. Silent."""
-        self._conversation_store.clear_all()
+    def _on_clear_model_history(self, model_id: str) -> None:
+        """Delete history for one model and reset its card display."""
+        self._conversation_store.clear_model(model_id)
+        card = self._cards.get(model_id)
+        if card is not None:
+            card.reset()
 
     # ---------- Streaming signal handlers ----------
 
@@ -348,7 +319,6 @@ class ComparisonView(QWidget):
     # ---------- Shutdown ----------
 
     def shutdown(self) -> None:
-        """Cancel workers, close the history store, clean up."""
         self._dispatcher.shutdown()
         self._conversation_store.close()
 

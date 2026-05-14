@@ -11,7 +11,7 @@ the app is hanging.
 """
 import sys
 
-DEBUG_STREAMING = True
+DEBUG_STREAMING = False
 
 
 def dbg(tag: str, msg: str) -> None:

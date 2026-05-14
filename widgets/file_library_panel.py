@@ -216,9 +216,9 @@ class FileLibraryPanel(QWidget):
         for row in self._rows.values():
             row.set_enabled(not busy)
         if busy:
-            QCursor.setPos(QCursor.pos())  # nudge to ensure repaint
             from PySide6.QtWidgets import QApplication
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            QApplication.processEvents()   # forces macOS to repaint cursor immediately
         else:
             from PySide6.QtWidgets import QApplication
             QApplication.restoreOverrideCursor()

@@ -2,9 +2,10 @@
 The prompt area — top of the Compare view.
 
 Contains: a multi-line prompt text box, model selection chips
-(loaded from the central registry), and action buttons.
+(loaded from the central registry), and the Run button.
 
 Files are managed in the sidebar's FILES section, not here.
+Clear History is per-card via the trash icon on each ResponseCard.
 """
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -25,9 +26,6 @@ class PromptArea(QFrame):
 
     # User clicked Run — payload = (prompt_text, [selected_model_ids])
     run_requested = Signal(str, list)
-
-    # User clicked Clear History
-    clear_history_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -101,17 +99,6 @@ class PromptArea(QFrame):
         root.addWidget(separator)
 
         bottom_row = QHBoxLayout()
-
-        # Clear History — same styling as Run button.
-        self._clear_history_button = QPushButton("Clear History")
-        self._clear_history_button.setObjectName("primary")
-        self._clear_history_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._clear_history_button.setToolTip(
-            "Delete all stored conversation history for all models"
-        )
-        self._clear_history_button.clicked.connect(self._on_clear_history_clicked)
-        bottom_row.addWidget(self._clear_history_button)
-
         bottom_row.addStretch()
 
         self._run_button = QPushButton("Run comparison  →")
@@ -154,6 +141,3 @@ class PromptArea(QFrame):
         if not prompt or not models:
             return
         self.run_requested.emit(prompt, models)
-
-    def _on_clear_history_clicked(self) -> None:
-        self.clear_history_requested.emit()
