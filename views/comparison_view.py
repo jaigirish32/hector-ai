@@ -11,25 +11,29 @@ After a successful response, the turn (user prompt + assistant text)
 is saved back to the store.
 
 Clear History is per-model — each ResponseCard has a trash icon button
-that emits clear_history_requested(model_id). ComparisonView handles
-it by deleting only that model's history from the store and resetting
-the card's display.
+that emits clear_history_requested(model_id).
+
+Startup / chip toggle behaviour
+--------------------------------
+All enabled model cards are rendered immediately on startup in EMPTY
+state. When a chip is toggled off, its card is removed from the grid
+but NOT destroyed — its state (history, response text) is preserved
+in memory. Toggle it back on and the card reappears exactly as it was.
+On each Run, only the currently-selected chips receive API calls.
 """
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QGridLayout,
-    QLabel,
     QScrollArea,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from attachments.file_library import FileLibrary
 from conversation_store import ConversationStore
-from models import ModelInfo, Provider, get_model
+from models import DEFAULT_MODELS, ModelInfo, Provider, get_model
 from providers.base import ChatResponse, FileRef, HistoryMessage
 from providers.dispatcher import Dispatcher
 from widgets.file_library_panel import FileLibraryPanel
@@ -87,7 +91,12 @@ class ComparisonView(QWidget):
     def __init__(self, file_library: FileLibrary) -> None:
         super().__init__()
 
+        # _cards holds ALL model cards ever created, whether visible or not.
+        # Cards are never destroyed on chip toggle — only removed from the
+        # grid. This preserves response state when a chip is toggled off
+        # and back on.
         self._cards: dict[str, ResponseCard] = {}
+
         self._file_library = file_library
         self._file_panel: FileLibraryPanel | None = None
         self._dispatcher = Dispatcher()
@@ -109,6 +118,7 @@ class ComparisonView(QWidget):
 
         self._prompt_area = PromptArea()
         self._prompt_area.run_requested.connect(self._on_run_requested)
+        self._prompt_area.selection_changed.connect(self._on_selection_changed)
         root.addWidget(self._prompt_area)
 
         self._cards_scroll = QScrollArea()
@@ -128,65 +138,73 @@ class ComparisonView(QWidget):
         self._cards_scroll.setWidget(self._cards_container)
         root.addWidget(self._cards_scroll, stretch=1)
 
-        self._empty_state = self._build_empty_state()
-        self._cards_grid.addWidget(self._empty_state, 0, 0)
+        # Create cards for all enabled models on startup and show them.
+        # All chips start selected so all cards are visible immediately.
+        self._create_all_cards()
+        self._regrid(self._prompt_area.selected_models())
 
     # ---------- Setup wiring ----------
 
     def set_file_panel(self, panel: FileLibraryPanel) -> None:
         self._file_panel = panel
 
-    # ---------- UI helpers ----------
+    # ---------- Card management ----------
 
-    def _build_empty_state(self) -> QWidget:
-        container = QWidget()
-        container.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        layout = QVBoxLayout(container)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    def _create_all_cards(self) -> None:
+        """Create ResponseCard objects for every enabled model.
 
-        heading = QLabel("Ready when you are.")
-        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        heading.setStyleSheet("color: #9A9A9A; font-size: 16px; font-weight: 500;")
-        layout.addWidget(heading)
-
-        hint = QLabel(
-            "Type a prompt above, pick your models, and click "
-            "Run to fan out across providers."
-        )
-        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hint.setStyleSheet("color: #5E5E5E; font-size: 12px;")
-        hint.setWordWrap(True)
-        hint.setMaximumWidth(420)
-        layout.addWidget(hint)
-
-        return container
-
-    def _clear_cards_grid(self) -> None:
-        while self._cards_grid.count() > 0:
-            item = self._cards_grid.takeAt(0)
-            widget = item.widget() if item else None
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        self._cards.clear()
-
-    def _lay_out_cards(self, models: list[ModelInfo]) -> None:
-        self._clear_cards_grid()
-
-        for index, model in enumerate(models):
+        Cards are created once and reused. They are never destroyed
+        during a session — only added/removed from the grid.
+        """
+        for model in DEFAULT_MODELS:
+            if not model.enabled or model.id in self._cards:
+                continue
             card = ResponseCard(model)
             card.cancel_requested.connect(self._on_cancel_requested)
             card.clear_history_requested.connect(self._on_clear_model_history)
             self._cards[model.id] = card
 
+    def _regrid(self, model_ids: list[str]) -> None:
+        """Remove all cards from the grid, then re-add only selected ones.
+
+        Cards not in model_ids are detached from the grid (setParent(None))
+        but remain in self._cards with their state intact. They reappear
+        unchanged when the chip is toggled back on.
+        """
+        # Detach all cards from grid without deleting them.
+        while self._cards_grid.count() > 0:
+            item = self._cards_grid.takeAt(0)
+            widget = item.widget() if item else None
+            if widget is not None:
+                widget.setParent(None)
+
+        # Re-add only the selected cards in DEFAULT_MODELS order.
+        selected = [
+            m for m in DEFAULT_MODELS
+            if m.enabled and m.id in model_ids
+        ]
+        for index, model in enumerate(selected):
+            card = self._cards.get(model.id)
+            if card is None:
+                continue
             row = index // 2
             col = index % 2
             self._cards_grid.addWidget(card, row, col)
 
         self._cards_grid.setColumnStretch(0, 1)
         self._cards_grid.setColumnStretch(1, 1)
+
+    # ---------- Chip toggle handler ----------
+
+    def _on_selection_changed(self, model_ids: list[str]) -> None:
+        """Chip toggled — update grid to show only selected cards.
+
+        Cards that are currently streaming or loading are NOT interrupted
+        — they keep running in the background. Their results will still
+        arrive via dispatcher signals and be applied when they finish,
+        even if the card is off-screen.
+        """
+        self._regrid(model_ids)
 
     # ---------- Run dispatch ----------
 
@@ -211,7 +229,8 @@ class ComparisonView(QWidget):
                 messages.append(HistoryMessage(role="assistant", content=turn.assistant_content))
             per_model_history[model.id] = tuple(messages)
 
-        self._lay_out_cards(models)
+        # Regrid to show exactly the selected cards.
+        self._regrid(model_ids)
 
         for model in models:
             card = self._cards.get(model.id)
@@ -275,7 +294,7 @@ class ComparisonView(QWidget):
     # ---------- Per-model clear history ----------
 
     def _on_clear_model_history(self, model_id: str) -> None:
-        """Delete history for one model and reset its card display."""
+        """Delete history for one model and reset its card to EMPTY state."""
         self._conversation_store.clear_model(model_id)
         card = self._cards.get(model_id)
         if card is not None:

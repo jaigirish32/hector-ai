@@ -27,6 +27,9 @@ class PromptArea(QFrame):
     # User clicked Run — payload = (prompt_text, [selected_model_ids])
     run_requested = Signal(str, list)
 
+    # Chip toggled — payload = [currently selected model_ids]
+    selection_changed = Signal(list)
+
     def __init__(self) -> None:
         super().__init__()
 
@@ -69,6 +72,16 @@ class PromptArea(QFrame):
             "color: #F87171; font-size: 14px; font-style: italic; padding: 0 2px;"
         )
         root.addWidget(pdf_only_note)
+
+        history_note = QLabel(
+            "Each model maintains its own conversation history. "
+            "History is not shared between models."
+        )
+        history_note.setWordWrap(True)
+        history_note.setStyleSheet(
+            "color: #F87171; font-size: 14px; font-style: italic; padding: 0 2px;"
+        )
+        root.addWidget(history_note)
 
         # ---------- Section 2: model chips row ----------
         chips_row = QHBoxLayout()
@@ -126,6 +139,7 @@ class PromptArea(QFrame):
 
     def _on_chip_toggled(self, model_id: str, is_selected: bool) -> None:
         self._update_run_button_state()
+        self.selection_changed.emit(self.selected_models())
 
     def _update_run_button_state(self) -> None:
         selected_count = sum(1 for chip in self._chips if chip.is_selected())

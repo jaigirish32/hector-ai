@@ -50,6 +50,13 @@ stroke-linejoin="round">
 <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
 </svg>"""
 
+_REFRESH_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+fill="none" stroke="#A0A0A0" stroke-width="2" stroke-linecap="round"
+stroke-linejoin="round">
+<polyline points="23 4 23 10 17 10"/>
+<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+</svg>"""
+
 
 def _svg_to_icon(svg_text: str, size: int = 20) -> QIcon:
     """Render an SVG string into a QIcon."""
@@ -232,8 +239,6 @@ class ResponseCard(QFrame):
 
     regenerate_requested = Signal(str)
     cancel_requested = Signal(str)
-    # Emitted when user clicks the per-card Clear History button.
-    # Carries model_id so ComparisonView can route to the right store entry.
     clear_history_requested = Signal(str)
 
     def __init__(self, model: ModelInfo) -> None:
@@ -327,7 +332,9 @@ class ResponseCard(QFrame):
         self._copy_icon_done = _svg_to_icon(_CHECK_ICON_SVG, size=16)
         self._stop_icon = _svg_to_icon(_STOP_ICON_SVG, size=14)
         self._trash_icon = _svg_to_icon(_TRASH_ICON_SVG, size=14)
+        self._refresh_icon = _svg_to_icon(_REFRESH_ICON_SVG, size=14)
 
+        # Stop button — visible during active generation only.
         self._stop_button = QPushButton()
         self._stop_button.setIcon(self._stop_icon)
         self._stop_button.setObjectName("stopButton")
@@ -338,8 +345,17 @@ class ResponseCard(QFrame):
         self._stop_button.setVisible(False)
         layout.addWidget(self._stop_button)
 
-        # Clear History button — trash icon, same size as copy/stop.
-        # Visible when not actively generating, hidden during active states.
+        # Refresh button — clears card display only, history preserved in DB.
+        self._refresh_button = QPushButton()
+        self._refresh_button.setIcon(self._refresh_icon)
+        self._refresh_button.setObjectName("copyButton")
+        self._refresh_button.setFixedSize(32, 28)
+        self._refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._refresh_button.setToolTip("Clear card display (history preserved)")
+        self._refresh_button.clicked.connect(self._on_refresh)
+        layout.addWidget(self._refresh_button)
+
+        # Trash button — deletes history from DB and resets card.
         self._clear_history_button = QPushButton()
         self._clear_history_button.setIcon(self._trash_icon)
         self._clear_history_button.setObjectName("copyButton")
@@ -349,6 +365,7 @@ class ResponseCard(QFrame):
         self._clear_history_button.clicked.connect(self._on_clear_history)
         layout.addWidget(self._clear_history_button)
 
+        # Copy button — enabled only after completion.
         self._copy_button = QPushButton()
         self._copy_button.setIcon(self._copy_icon_default)
         self._copy_button.setObjectName("copyButton")
@@ -617,6 +634,7 @@ class ResponseCard(QFrame):
         self._set_status(text, accent=accent)
 
     def reset(self) -> None:
+        """Return card to EMPTY state. Also called by trash button after DB clear."""
         self._render_timer.stop()
         self._stream_buffer = ""
         self._history_html = ""
@@ -662,9 +680,10 @@ class ResponseCard(QFrame):
     def _apply_state(self) -> None:
         """Toggle buttons based on current state.
 
-        Stop   — visible during active generation.
-        Trash  — visible when not actively generating (idle, complete, error).
-        Copy   — visible when not actively generating; enabled only on COMPLETE.
+        Stop    — visible during active generation only.
+        Refresh — visible when not generating (clears display, preserves DB history).
+        Trash   — visible when not generating (clears display + DB history).
+        Copy    — visible when not generating; enabled only on COMPLETE.
         """
         active_states = (
             CardState.LOADING,
@@ -675,12 +694,14 @@ class ResponseCard(QFrame):
         is_cancelling = self._state == CardState.CANCELLING
         is_complete = self._state == CardState.COMPLETE
 
+        not_generating = not (is_active or is_cancelling)
+
         self._stop_button.setVisible(is_active or is_cancelling)
         self._stop_button.setEnabled(is_active)
 
-        # Trash and Copy share the same visibility rule — hidden during
-        # active generation, visible at all other times.
-        not_generating = not (is_active or is_cancelling)
+        self._refresh_button.setVisible(not_generating)
+        self._refresh_button.setEnabled(not_generating)
+
         self._clear_history_button.setVisible(not_generating)
         self._clear_history_button.setEnabled(not_generating)
 
@@ -710,10 +731,26 @@ class ResponseCard(QFrame):
         self._apply_state()
         self.cancel_requested.emit(self._model.id)
 
-    def _on_clear_history(self) -> None:
-        """User clicked the trash icon — emit signal with model_id.
-        ComparisonView handles the actual store deletion and UI reset.
+    def _on_refresh(self) -> None:
+        """Clear card display only — history in DB is preserved.
+
+        Next Run will reload history from DB and show it again.
+        Use this to get a clean view without losing conversation history.
         """
+        self._render_timer.stop()
+        self._stream_buffer = ""
+        self._history_html = ""
+        self._current_prompt_html = ""
+        self._state = CardState.EMPTY
+        self._body.clear()
+        self._body.setPlaceholderText("Waiting for prompt...")
+        self._update_metrics("—", "—", "—")
+        self._set_caveats(())
+        self._set_status("", accent=False)
+        self._apply_state()
+
+    def _on_clear_history(self) -> None:
+        """Emit signal so ComparisonView deletes DB history and resets card."""
         self.clear_history_requested.emit(self._model.id)
 
     def _revert_copy_icon(self) -> None:
